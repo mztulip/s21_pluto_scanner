@@ -40,34 +40,6 @@ mfreqz(b_fir)
 
 show()
 
-# cutoff = 900_000 / nyq_rate
-# b, a = iirfilter(   N = 15, 
-#                     Wn = [cutoff],
-#                     btype='lowpass',
-#                     analog=False,
-#                     ftype='cheby2',
-#                     rp = 10,
-#                     rs= 50)
-
-# print(f"b: {b}")
-# print(f"a: {a}")
-# N = len(b)
-# M = len(a)
-
-# w, h = freqz(b, a, worN = 800)
-
-# fig2 = figure()
-# clf()
-# plot((w/np.pi)*nyq_rate/ 1_000_000, 20 * np.log10(np.maximum(abs(h), 1e-5)), linewidth=2)
-# xlabel('Frequency (MHz)')
-# ylabel('Gain')
-# title('Frequency Response')
-# ax2 = fig2.gca()
-# ax2.set_xticks(np.arange(0, 10, 0.5))
-# # ylim(-0.05, 1.05)
-# grid(visible=True, which='both')
-
-
 # #------------------------------------------------
 # # Plot the original and filtered signals.
 # #------------------------------------------------

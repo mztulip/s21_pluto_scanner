@@ -116,7 +116,8 @@ def smooth_trace(y, k):
 # ───────────── worker thread ─────────────
 class SweepThread(QThread):
     update  = pyqtSignal(float, float)
-    started = pyqtSignal()
+    reset_signal = pyqtSignal()
+    scan_finished = pyqtSignal()
     trigger_start_signal = pyqtSignal()
     error   = pyqtSignal(str)
 
@@ -155,6 +156,7 @@ class SweepThread(QThread):
 
     def run(self):
         time.sleep(SWEEP_INIT_DELAY)
+        self.reset_signal.emit()
         while not self.stop_flag:
             while self.trigger_start is False:
                 print("Waiting for start trigger")
@@ -163,7 +165,6 @@ class SweepThread(QThread):
                 time.sleep(1)
             self.trigger_start = False
             freqs = np.linspace(self.f0, self.f1, self.n)
-            self.started.emit()
             for i, f in enumerate(freqs):
                 if self.stop_flag or self.trigger_start is True:
                     break
@@ -192,6 +193,7 @@ class SweepThread(QThread):
 
                 self.update.emit(f, s21)
 
+            self.scan_finished.emit()
             if not self.stop_flag:
                 time.sleep(1)
 
@@ -249,6 +251,10 @@ class VNA(QMainWindow):
         self.cbSmooth.stateChanged.connect(self._vis_toggle)
         self.cbRaw.stateChanged.connect(self._vis_toggle)
 
+        self.checkbox_single = QCheckBox("Single scan")
+        self.checkbox_single.setChecked(False)
+        h.addWidget(self.checkbox_single)
+
         v.addWidget(top)
 
         pb_start = QPushButton("Restart")
@@ -266,10 +272,15 @@ class VNA(QMainWindow):
 
     # --- traces + markers storage + titles ---
     def _init_plot(self):
+        self.first_plot = True
         self.x21, self.y21r = [], []
+        self.x21_freq, self.y21_value = [], []
 
         self.l21, = self.ax21.plot([], [], 'b-', lw=1.2, label='S21 smoothed')
         self.d21, = self.ax21.plot([], [], 'ro', ms=4,   label='S21 raw')
+
+        self.s21_line_continuous, = self.ax21.plot([], [], 'y-', lw=1.2, label='S21 smoothed2')
+        self.s21_dots_continuous, = self.ax21.plot([], [], 'go', ms=4,   label='S21 raw2')
 
         self.ax21.set_title("S21 (dB)")
 
@@ -281,13 +292,15 @@ class VNA(QMainWindow):
         self.canvas.mpl_connect('button_press_event', self._on_click)
         self.markers = []
         self._vis_toggle()
+        self.point_index = 0
 
     # --- worker startup ---
     def _spawn_worker(self):
         self.wk = SweepThread(sdr)
-        self.wk.update.connect(self._update)
-        self.wk.started.connect(self._reset)
+        self.wk.update.connect(self._update_plot)
+        self.wk.reset_signal.connect(self._reset)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
+        self.wk.scan_finished.connect(self._scan_finished)
         self.wk.start()
         self.wk.trigger_start_signal.emit()
 
@@ -307,29 +320,58 @@ class VNA(QMainWindow):
         self.wk.stop_flag = False
         self.wk.start()
         self.ax21.set_xlim(f0/1e9, f1/1e9)
-        # self.ax11.set_xlim(f0/1e9, f1/1e9)
         self.canvas.draw()
 
-    # --- plotting updates ---
+    def _scan_finished(self):
+        print("Scan finished")
+        self.point_index = 0
+        self.first_plot = False
+        if not self.checkbox_single.isChecked():
+            self.wk.trigger_start_signal.emit()
+
     def _reset(self):
-        self.x21.clear(); self.y21r.clear()
-        # self.x11.clear(); self.y11r.clear()
+        self.point_index = 0
+        self.x21.clear()
+        self.y21r.clear()
+
+        self.x21_freq.clear()
+        self.y21_value.clear()
+
         for ln in (self.l21, self.d21):
             ln.set_data([], [])
         self._clear_markers()
         self.canvas.draw()
 
-    def _update(self, f, s21):
+    def _update_plot(self, f, s21):
         fGHz = f/1e9
-        self.x21.append(fGHz); self.y21r.append(s21)
+        if self.first_plot:
+            x_data = self.x21
+            y_data = self.y21r
+            s21_plot_line = self.l21
+            s21_plot_dot = self.d21
+            print("First plot")
+        else:
+            x_data = self.x21_freq
+            y_data = self.y21_value
+            s21_plot_line = self.s21_line_continuous
+            s21_plot_dot = self.s21_dots_continuous
+            print("Not first plot")
 
-        self.l21.set_data(self.x21, smooth_trace(np.array(self.y21r), SMOOTH_WIN21))
-        self.d21.set_data(self.x21, self.y21r)
+        try:
+            y_data[self.point_index] = s21
+
+        except IndexError:
+            y_data.append(s21)
+            x_data.append(fGHz)
+
+        s21_plot_line.set_data(x_data, smooth_trace(np.array(y_data), SMOOTH_WIN21))
+        s21_plot_dot.set_data(x_data, y_data)
 
         self.ax21.relim(); 
         self.ax21.autoscale_view(scalex=False)
 
         self.canvas.draw_idle()
+        self.point_index  += 1
 
     # --- visibility toggles ---
     def _vis_toggle(self):
@@ -361,7 +403,7 @@ class VNA(QMainWindow):
             mrk = ax.plot(x, y, 'kx', ms=8, mew=2)[0]
             txt = ax.annotate(f"{y:.2f} dB\n{x:.3f} GHz",
                               (x, y),
-                              textcoords="ofAD_SAMPLING_FREQUENCYet points",
+                              textcoords="offset points",
                               xytext=(5, 5),
                               fontsize=8,
                               color='k',
