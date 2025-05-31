@@ -213,25 +213,27 @@ class VNA(QMainWindow):
     def _build_ui(self):
         cw = QWidget()
         self.setCentralWidget(cw)
-        v = QVBoxLayout(cw)
+        box1 = QVBoxLayout(cw)
+
 
         top = QFrame()
         top.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
-        h = QHBoxLayout(top)
+
+        h_box1 = QHBoxLayout(top)
 
         for lbl, attr, val in [
             ("Start (MHz):","le0", int(MIN_FREQ/1e6)),
             ("Stop (MHz):", "le1", int(MAX_FREQ/1e6)),
             ("Steps:",       "leN", DEFAULT_STEPS)
         ]:
-            h.addWidget(QLabel(lbl))
+            h_box1.addWidget(QLabel(lbl))
             le = QLineEdit(str(val))
             setattr(self, attr, le)
-            h.addWidget(le)
+            h_box1.addWidget(le)
 
         pb = QPushButton("Apply")
         pb.clicked.connect(self.apply_span)
-        h.addWidget(pb)
+        h_box1.addWidget(pb)
 
         for txt, fn in [
             ("Cal S21", self.cal_s21),
@@ -239,32 +241,35 @@ class VNA(QMainWindow):
         ]:
             btn = QPushButton(txt)
             btn.clicked.connect(fn)
-            h.addWidget(btn)
+            h_box1.addWidget(btn)
 
-        h.addWidget(QLabel("Show:"))
+        h_box1.addWidget(QLabel("Show:"))
         self.cbSmooth = QCheckBox("Smoothed")
         self.cbSmooth.setChecked(True)
-        h.addWidget(self.cbSmooth)
+        h_box1.addWidget(self.cbSmooth)
         self.cbRaw = QCheckBox("Raw")
         self.cbRaw.setChecked(True)
-        h.addWidget(self.cbRaw)
+        h_box1.addWidget(self.cbRaw)
         self.cbSmooth.stateChanged.connect(self._vis_toggle)
         self.cbRaw.stateChanged.connect(self._vis_toggle)
 
         self.checkbox_single = QCheckBox("Single scan")
         self.checkbox_single.setChecked(False)
-        h.addWidget(self.checkbox_single)
+        h_box1.addWidget(self.checkbox_single)
 
-        v.addWidget(top)
+        box1.addWidget(top)
 
         pb_start = QPushButton("Restart")
         pb_start.clicked.connect(self._start_from_beginning)
-        h.addWidget(pb_start)
+        h_box1.addWidget(pb_start)
+
+        self.freq_label = QLabel("f:--")
+        h_box1.addWidget(self.freq_label)
 
         self.fig, self.ax21 = plt.subplots(1,1, figsize=(12,9))
         self.canvas = FigureCanvas(self.fig)
-        v.addWidget(self.canvas)
-        v.addWidget(NavigationToolbar2QT(self.canvas, self))
+        box1.addWidget(self.canvas)
+        box1.addWidget(NavigationToolbar2QT(self.canvas, self))
 
     def _start_from_beginning(self):
         self._reset()
@@ -344,6 +349,7 @@ class VNA(QMainWindow):
 
     def _update_plot(self, f, s21):
         fGHz = f/1e9
+        self.freq_label.setText(f"Freq:{fGHz*1000}MHz")
         if self.first_plot:
             x_data = self.x21
             y_data = self.y21r
@@ -379,6 +385,8 @@ class VNA(QMainWindow):
         showR = self.cbRaw.isChecked()
         self.l21.set_visible(showS); 
         self.d21.set_visible(showR); 
+        self.s21_line_continuous.set_visible(showS); 
+        self.s21_dots_continuous.set_visible(showR); 
         self.canvas.draw_idle()
 
     # --- marker handling ---
