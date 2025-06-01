@@ -38,8 +38,8 @@ DWELL, CLR_READS, EPS = 0.1, 1, 1e-15
 MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 
 # ───────────── hardware initialisation ─────────────
-sdr = adi.Pluto(uri=SDR_URI)
-# sdr = adi.Pluto("ip:192.168.2.137")
+# sdr = adi.Pluto(uri=SDR_URI)
+sdr = adi.Pluto("ip:192.168.2.137")
 sdr.sample_rate             = int(AD_SAMPLING_FREQUENCY)
 sdr.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
 sdr.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
@@ -47,28 +47,27 @@ sdr.rx_buffer_size          = SAMPLE_BUFFER_SIZE
 sdr.tx_buffer_size          = SAMPLE_BUFFER_SIZE
 sdr.gain_control_mode_chan0 = "manual"
 sdr.tx_cyclic_buffer        = True
-# sdr.tx_hardwaregain_chan0   = -10
-# sdr.rx_hardwaregain_chan0   = 50
 
 
-#Output power maximum is about 7-8dBm,
-# attenuaition -50 gives power 8-50=-42dBm
-# fo POWER AMP testing this value is too low(with additional -10dB attenuaator it gives -52dB)
-# for -30 -> 8-30 =-22dBm(-32dBm) real measured is -40dB to small for PA
-# for -20 -> 8-30 =-12dBm(-22dBm) real measured is -30dB to small for PA
-# sdr.tx_hardwaregain_chan0   = -50
+### TX SIDE ###
+sdr.tx_hardwaregain_chan0   = -30
+#with -30dB -10dB ext att=-40dB and 20dB att RX, 0dB internal. THere are problems. 5dB attenuation is measured perfectly, but 30dB with lot of oscillations(because this is noise or leakage of TX inside pluto).
+# -40-20-30=-90dbm it seems limit of dynamic range for this device not leakage.
+# it seems that good option is  to add 10dB ext(necessary to improve impedance matching) att at TX, with -30db internal.
+#It gives low internal TX RX leekage and about -40dBm (confirmed with power meter), libreSDR gives about 5dB less power
+#Pluto must be supplied from two usb cables without it output power is not stable and changes in time.
+#with this configuration and internal rx amp set to 0dB data from IQ is about -71dB refered to 2^12 from ADC.
+# Another problem is that with such TX power, open circuit noise reaches -25dB(-117 not calib) at 3GHz, -35dB at 1GHz.(with calibrated through) 
+# libreSDR gives similar values  -39dB(-110 not calib) at 1GHz. -24(-109) at 3GHz
+# with LNA internal 10dB at 1GHz it gives -36(-107) worst point is 2.13ghz -17dB, and 3.2GHz -14dB, therefore with internal LNA it is not usable due to signal leakage.
 
-#without attenuated output, with open circuit rx receives signal 0dB, it can not work.
-sdr.tx_hardwaregain_chan0   = -50
 
 
-
-#To be below IP3 point in full range, the safe input power must be below -18dBm
-
+### RX SIDE ######
+#To be below RX IP3 point in full range, the safe input power must be below -18dBm
 #when added 10dB(tx side) and 20dB(rx side) attenuators in series to improve impedance
-#then rx gain can be increased to 50
-
-# sdr.rx_hardwaregain_chan0   = 20
+#due to bad impedance match -5dB below 1GHz, at rx port should be 20dB external attenuator added
+#without it s21 works really bad, it is bad event with 10dB attenautaor. 30dB attenuator can not be measured due to reflections in cable.
 sdr.rx_hardwaregain_chan0   = 0
 
 
@@ -184,11 +183,16 @@ class SweepThread(QThread):
                 for j in range(NUM_R):
                     r = self._safe_rx()
                     print(f"Freqpoint: {f} IQ:{r}")
-                    acc0[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12) 
+                    acc0[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)
 
-                s21 = to_dB(lockin(acc0))
+                s21_amplitude = lockin(acc0)
+                s21 = to_dB(s21_amplitude)
+                print(f"S21 dB: {s21} raw filtered ADC: {s21_amplitude}")
+                offset = None
                 if self.cal21 is not None:
-                    s21 -= np.interp(f, self.cal21['freqs'], self.cal21['db'])
+                    offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
+                    s21 -= offset
+                print(f"S21 calirated: {s21} calib offset: {offset}")
 
 
                 self.update.emit(f, s21)
@@ -439,7 +443,7 @@ class VNA(QMainWindow):
             acc = np.zeros(SAMPLE_BUFFER_SIZE*NUM_R, np.complex64)
             for j in range(NUM_R):
                 r = sdr.rx()
-                acc[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)*7
+                acc[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)
             A = lockin(acc)
             out['freqs'].append(f)
             out['linear'].append(A)
