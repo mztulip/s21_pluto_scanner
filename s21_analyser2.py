@@ -106,6 +106,57 @@ def smooth_trace(y, k):
 fft_size = 4096*8
 fft_magnitude_db = None
 
+class Point():
+    def __init__(self, dev_tx, dev_rx):
+        self.dev_tx = dev_tx
+        self.dev_rx = dev_rx
+
+    def _safe_rx(self):
+        try:
+            return self.dev_rx.rx()
+        except Exception as e:
+            print(f"SDR RX error: {e}")
+            raise
+
+    def get(self, frequency_hz):
+        try:
+            self.dev_tx.tx_lo = int(frequency_hz)
+            self.dev_rx.rx_lo = int(frequency_hz)
+        except Exception as e:
+            print(f"SDR tune error: {e}")
+            return None
+
+        time.sleep(DWELL)
+        try:
+            for _ in range(CLR_READS):
+                self._safe_rx()
+
+        except Exception as e:
+            self.stop_flag = True
+            return None
+
+
+        iq_buffer = np.zeros(SAMPLE_BUFFER_SIZE, np.complex64)
+        iq_buffer = self._safe_rx()/(2**12)
+        print(f"Freqpoint: {frequency_hz}")
+
+        iq_filtered = apply_filter(iq_buffer)
+        iq_filtered = iq_filtered[N:]  # discard FIR transient
+
+        samples = iq_filtered.size
+        fft_iq_buffer = iq_filtered[samples-fft_size:]
+
+        global fft_magnitude_db
+        fft_bins = np.fft.fftshift(np.fft.fft(fft_iq_buffer))/(fft_size)
+        magnitude = np.abs(fft_bins)
+        fft_magnitude_db = 20*np.log10(magnitude)
+        freq_peak_index = np.argmax(fft_magnitude_db)
+        s21 = fft_magnitude_db[freq_peak_index]
+        print(f"FFT Peak index: {freq_peak_index} Value:{s21}")  
+
+        return s21
+
+
 # ───────────── worker thread ─────────────
 class SweepThread(QThread):
     update  = pyqtSignal(float, float)
@@ -144,55 +195,10 @@ class SweepThread(QThread):
         self.cal21 = d
         print(f"Loaded cals: {d}")
 
-
-    def _safe_rx(self):
-        try:
-            return self.dev_rx.rx()
-        except Exception as e:
-            self.error.emit(f"SDR RX error: {e}")
-            self.stop_flag = True
-            raise
-
-
-    def _get_single_point(self, frequency_hz):
-        try:
-            self.dev_tx.tx_lo = int(frequency_hz)
-            self.dev_rx.rx_lo = int(frequency_hz)
-        except Exception as e:
-            self.error.emit(f"SDR tune error: {e}")
-            self.stop_flag = True
-            return None
-
-        time.sleep(DWELL)
-        for _ in range(CLR_READS):
-            self._safe_rx()
-
-
-        iq_buffer = np.zeros(SAMPLE_BUFFER_SIZE, np.complex64)
-        iq_buffer = self._safe_rx()/(2**12)
-        print(f"Freqpoint: {frequency_hz}")
-
-        iq_filtered = apply_filter(iq_buffer)
-        iq_filtered = iq_filtered[N:]  # discard FIR transient
-
-        samples = iq_filtered.size
-        fft_iq_buffer = iq_filtered[samples-fft_size:]
-
-        global fft_magnitude_db
-        fft_bins = np.fft.fftshift(np.fft.fft(fft_iq_buffer))/(fft_size)
-        magnitude = np.abs(fft_bins)
-        fft_magnitude_db = 20*np.log10(magnitude)
-        freq_peak_index = np.argmax(fft_magnitude_db)
-        s21 = fft_magnitude_db[freq_peak_index]
-        print(f"FFT Peak index: {freq_peak_index} Value:{s21}")  
-        rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
-        print(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
-        return s21
-
-
     def run(self):
         time.sleep(SWEEP_INIT_DELAY)
         self.reset_signal.emit()
+        point = Point(self.dev_tx, self.dev_rx)
         while not self.stop_flag:
             while self.trigger_start is False:
                 print("Waiting for start trigger")
@@ -202,21 +208,24 @@ class SweepThread(QThread):
             self.trigger_start = False
             freqs = np.linspace(self.f0, self.f1, self.n)
             freq_index = 0
-            # for i, f in enumerate(freqs):
+            
             while freq_index < len(freqs):
                 i = freq_index
                 f = freqs[i]
                 if self.stop_flag or self.trigger_start is True:
                     break
         
-                s21 = self._get_single_point(f)
+                s21 = point.get(f)
                 if s21 is None:
+                    self.stop_flag = True
                     break
 
                 offset = None
                 if self.cal21 is not None:
                     offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
                     s21 -= offset
+                rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
+                print(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
 
                 self.update.emit(f, s21)
 
@@ -452,11 +461,8 @@ class VNA(QMainWindow):
         self.markers.clear()
 
     def _on_click(self, event):
-        # if event.inaxes not in (self.axes_s21):
-        #     return
         ax = event.inaxes
         if event.button == 1:
-            # if ax is self.axes_s21:
             xdata = self.x21
             ydata = self.y21r if self.d21.get_visible() else list(self.l21.get_ydata())
             if not xdata:
@@ -489,21 +495,11 @@ class VNA(QMainWindow):
             if dlg.wasCanceled():
                 return None
             dlg.setValue(i); QApplication.processEvents()
-            NUM_R = 4 if f < 1e9 else 1
-            sdr1.tx_lo = int(f)
-            sdr2.rx_lo = int(f); 
-            
-            time.sleep(DWELL)
-            for _ in range(CLR_READS):
-                sdr2.rx()
-            acc = np.zeros(SAMPLE_BUFFER_SIZE*NUM_R, np.complex64)
-            for j in range(NUM_R):
-                r = sdr2.rx()
-                acc[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)
-            A = lockin(acc)
-            print(f"Calpoint f:{f} value: {to_dB(A)}dB")
-            out['freqs'].append(f)
-            out['db'].append(to_dB(A))
+          
+            # s21_point=
+            # print(f"Calpoint f:{f} value: {s21_point}dB")
+            # out['freqs'].append(f)
+            # out['db'].append(s21_point)
         dlg.close()
         return {k: np.array(v) for k, v in out.items()}
 
