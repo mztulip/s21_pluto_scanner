@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-PlutoSDR VNA Pro – interactive edition
-======================================
-• FFT-based FIR lock-in
-• Calibration + skip-mask for S11
-• Moving-average smoothing **toggle**
-• Add/remove markers with left / right mouse clicks
-• Clamp S11 to a maximum of 0 dB
-"""
-
-# ───────────── imports ─────────────
 import sys, os, time, traceback
 import numpy as np
 import pandas as pd
@@ -28,51 +17,53 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # ───────────── configuration constants ─────────────
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
-FILT_RIPPLE_DB, FILT_CUTOFF_HZ, FILT_TRANS_WIDTH_HZ = 70, 500, 100
+FILT_RIPPLE_DB = 70
+FILT_CUTOFF_HZ = 5_000
+FILT_TRANS_WIDTH_HZ = 100
 DEFAULT_STEPS, CAL_POINTS = 500, 500
 SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
-SDR_URI = "ip:pluto.local"
-AD_SAMPLING_FREQUENCY, SAMPLE_BUFFER_SIZE, TX_TONE_FREQ = 8e6, 350000, 543e3
-RF_FILTER_BANDWIDTH=4e6
+AD_SAMPLING_FREQUENCY = 10e6
+SAMPLE_BUFFER_SIZE = 500_000
+TX_TONE_FREQ = 100_000
+RF_FILTER_BANDWIDTH=1e6
 DWELL, CLR_READS, EPS = 0.1, 1, 1e-15
 MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 
 # ───────────── hardware initialisation ─────────────
-# sdr = adi.Pluto(uri=SDR_URI)
-sdr = adi.Pluto("ip:192.168.2.137")
-sdr.sample_rate             = int(AD_SAMPLING_FREQUENCY)
-sdr.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr.rx_buffer_size          = SAMPLE_BUFFER_SIZE
-sdr.tx_buffer_size          = SAMPLE_BUFFER_SIZE
-sdr.gain_control_mode_chan0 = "manual"
-sdr.tx_cyclic_buffer        = True
 
+# sdr1 = adi.Pluto("ip:192.168.2.137")
+sdr1 = adi.ad9361("ip:192.168.2.137")
+sdr1.tx_enabled_channels     = [1]
+sdr1.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+sdr1.tx_buffer_size          = 100_000
+sdr1.tx_cyclic_buffer        = True
+sdr1.tx_hardwaregain_chan0   = -3
 
-### TX SIDE ###
-sdr.tx_hardwaregain_chan0   = -30
-#with -30dB -10dB ext att=-40dB and 20dB att RX, 0dB internal. THere are problems. 5dB attenuation is measured perfectly, but 30dB with lot of oscillations(because this is noise or leakage of TX inside pluto).
-# -40-20-30=-90dbm it seems limit of dynamic range for this device not leakage.
-# it seems that good option is  to add 10dB ext(necessary to improve impedance matching) att at TX, with -30db internal.
-#It gives low internal TX RX leekage and about -40dBm (confirmed with power meter), libreSDR gives about 5dB less power
-#Pluto must be supplied from two usb cables without it output power is not stable and changes in time.
-#with this configuration and internal rx amp set to 0dB data from IQ is about -71dB refered to 2^12 from ADC.
-# Another problem is that with such TX power, open circuit noise reaches -25dB(-117 not calib) at 3GHz, -35dB at 1GHz.(with calibrated through) 
-# libreSDR gives similar values  -39dB(-110 not calib) at 1GHz. -24(-109) at 3GHz
-# with LNA internal 10dB at 1GHz it gives -36(-107) worst point is 2.13ghz -17dB, and 3.2GHz -14dB, therefore with internal LNA it is not usable due to signal leakage.
-#therefore the best idea is to add external PA at TX side.
+#this is not  used in sdr1 but I think should be configured to be in known state
+sdr1.sample_rate             = int(AD_SAMPLING_FREQUENCY)
+sdr1.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+sdr1.rx_buffer_size          = SAMPLE_BUFFER_SIZE
+sdr1.gain_control_mode_chan0 = "manual"
+sdr1.rx_hardwaregain_chan0   = 0
+sdr1._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
 
+SDR_URI = "ip:pluto.local"
+sdr2 = adi.Pluto(uri=SDR_URI)
+sdr2.sample_rate             = int(AD_SAMPLING_FREQUENCY)
+sdr2.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+sdr2.rx_buffer_size          = SAMPLE_BUFFER_SIZE
+sdr2.gain_control_mode_chan0 = "manual"
+sdr2.rx_hardwaregain_chan0   = 20
+sdr2.tx_hardwaregain_chan0   = -89
+sdr2._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
+sdr2._set_iio_dev_attr_str("xo_correction", 40000000-380)
+print(f"XO correcton: {sdr2._get_iio_dev_attr("xo_correction")}")
 
-### RX SIDE ######
-#To be below RX IP3 point in full range, the safe input power must be below -18dBm
-#when added 10dB(tx side) and 20dB(rx side) attenuators in series to improve impedance
-#due to bad impedance match -5dB below 1GHz, at rx port should be 20dB external attenuator added
-#without it s21 works really bad, it is bad event with 10dB attenautaor. 30dB attenuator can not be measured due to reflections in cable.
-sdr.rx_hardwaregain_chan0   = 0
+_t = np.arange(10_000) / AD_SAMPLING_FREQUENCY
+tx_samples = (0.5*np.exp(2j * np.pi * TX_TONE_FREQ * _t)).astype(np.complex64)
+tx_samples *= 2**14 
+sdr1.tx(tx_samples)
 
-
-_t = np.arange(SAMPLE_BUFFER_SIZE) / AD_SAMPLING_FREQUENCY
-sdr.tx((np.exp(2j * np.pi * TX_TONE_FREQ * _t) * (2**14)).astype(np.complex64))
 
 # ───────────── FIR filter for lock-in ─────────────
 nyq     = AD_SAMPLING_FREQUENCY / 2
@@ -112,6 +103,9 @@ def smooth_trace(y, k):
     out[good] = num[good] / den[good]
     return out
 
+fft_size = 4096*8
+fft_magnitude_db = None
+
 # ───────────── worker thread ─────────────
 class SweepThread(QThread):
     update  = pyqtSignal(float, float)
@@ -119,16 +113,22 @@ class SweepThread(QThread):
     scan_finished = pyqtSignal()
     trigger_start_signal = pyqtSignal()
     error   = pyqtSignal(str)
+    pause_signal = pyqtSignal(bool)
 
-    def __init__(self, dev):
+    def __init__(self, dev_tx, dev_rx):
         super().__init__()
-        self.dev       = dev
+        self.dev_tx = dev_tx
+        self.dev_rx = dev_rx
         self.f0, self.f1, self.n = MIN_FREQ, MAX_FREQ, DEFAULT_STEPS
         self.stop_flag = False
         self.cal21     = None
         self.trigger_start = False
         self.trigger_start_signal.connect(self._trigger_start)
+        self.pause_signal.connect(self._pause_signal_handle)
+        self.scan_paused = False
 
+    def _pause_signal_handle(self, paused: bool):
+        self.scan_paused = paused
 
     def _trigger_start(self):
         print("Start trigger emmited")
@@ -147,7 +147,7 @@ class SweepThread(QThread):
 
     def _safe_rx(self):
         try:
-            return self.dev.rx()
+            return self.dev_rx.rx()
         except Exception as e:
             self.error.emit(f"SDR RX error: {e}")
             self.stop_flag = True
@@ -164,12 +164,17 @@ class SweepThread(QThread):
                 time.sleep(1)
             self.trigger_start = False
             freqs = np.linspace(self.f0, self.f1, self.n)
-            for i, f in enumerate(freqs):
+            freq_index = 0
+            # for i, f in enumerate(freqs):
+            while freq_index < len(freqs):
+                i = freq_index
+                f = freqs[i]
                 if self.stop_flag or self.trigger_start is True:
                     break
                 NUM_R = 4 if f < 1e9 else 1
                 try:
-                    self.dev.tx_lo = self.dev.rx_lo = int(f)
+                    self.dev_tx.tx_lo = int(f)
+                    self.dev_rx.rx_lo = int(f)
                 except Exception as e:
                     self.error.emit(f"SDR tune error: {e}")
                     self.stop_flag = True
@@ -179,23 +184,43 @@ class SweepThread(QThread):
                 for _ in range(CLR_READS):
                     self._safe_rx()
 
-                acc0 = np.zeros(SAMPLE_BUFFER_SIZE * NUM_R, np.complex64)
+                iq_buffer = np.zeros(SAMPLE_BUFFER_SIZE * NUM_R, np.complex64)
                 for j in range(NUM_R):
                     r = self._safe_rx()
                     print(f"Freqpoint: {f} IQ:{r}")
-                    acc0[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)
+                    iq_buffer[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)
 
-                s21_amplitude = lockin(acc0)
-                s21 = to_dB(s21_amplitude)
-                print(f"S21 dB: {s21} raw filtered ADC: {s21_amplitude}")
+                iq_filtered = apply_filter(iq_buffer)
+                iq_filtered = iq_filtered[N:]  # discard FIR transient
+
+                fft_iq_buffer = iq_filtered[0:fft_size]
+
+                global fft_magnitude_db
+                fft_bins = np.fft.fftshift(np.fft.fft(fft_iq_buffer))/(fft_size)
+                magnitude = np.abs(fft_bins)
+                fft_magnitude_db = 20*np.log10(magnitude)
+                freq_peak_index = np.argmax(fft_magnitude_db)
+                s21 = fft_magnitude_db[freq_peak_index]
+                print(f"FFT Peak index: {freq_peak_index} Value:{s21}")
+
+
+                # s21 = to_dB(s21_amplitude)
+                # print(f"S21 dB: {s21} raw filtered ADC: {s21_amplitude}")
+                # s21_amplitude = np.abs(iq_filtered).mean()
+
+                
+
                 offset = None
                 if self.cal21 is not None:
                     offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
                     s21 -= offset
-                print(f"S21 calirated: {s21} calib offset: {offset}")
-
+                rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
+                print(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
 
                 self.update.emit(f, s21)
+
+                if self.scan_paused is False:
+                    freq_index += 1
 
             self.scan_finished.emit()
             if not self.stop_flag:
@@ -270,10 +295,24 @@ class VNA(QMainWindow):
         self.freq_label = QLabel("f:--")
         h_box1.addWidget(self.freq_label)
 
-        self.fig, self.ax21 = plt.subplots(1,1, figsize=(12,9))
+        self.fig, (self.axes_s21, self.axes_fft) = plt.subplots(2,1, figsize=(12,9))
         self.canvas = FigureCanvas(self.fig)
         box1.addWidget(self.canvas)
         box1.addWidget(NavigationToolbar2QT(self.canvas, self))
+
+        button_pause = QPushButton("Pause")
+        button_pause.clicked.connect(self._pause_emit)
+        h_box1.addWidget(button_pause)
+
+        button_continue = QPushButton("Continue")
+        button_continue.clicked.connect(self._continue_emit)
+        h_box1.addWidget(button_continue)
+
+    def _pause_emit(self):
+        self.wk.pause_signal.emit(True)
+
+    def _continue_emit(self):
+        self.wk.pause_signal.emit(False)
 
     def _start_from_beginning(self):
         self._reset()
@@ -285,18 +324,25 @@ class VNA(QMainWindow):
         self.x21, self.y21r = [], []
         self.x21_freq, self.y21_value = [], []
 
-        self.l21, = self.ax21.plot([], [], 'b-', lw=1.2, label='S21 smoothed')
-        self.d21, = self.ax21.plot([], [], 'ro', ms=4,   label='S21 raw')
+        self.l21, = self.axes_s21.plot([], [], 'b-', lw=1.2, label='S21 smoothed')
+        self.d21, = self.axes_s21.plot([], [], 'ro', ms=4,   label='S21 raw')
 
-        self.s21_line_continuous, = self.ax21.plot([], [], 'y-', lw=1.2, label='S21 smoothed2')
-        self.s21_dots_continuous, = self.ax21.plot([], [], 'go', ms=4,   label='S21 raw2')
+        self.s21_line_continuous, = self.axes_s21.plot([], [], 'y-', lw=1.2, label='S21 smoothed2')
+        self.s21_dots_continuous, = self.axes_s21.plot([], [], 'go', ms=4,   label='S21 raw2')
 
-        self.ax21.set_title("S21 (dB)")
+        self.axes_s21.set_title("S21 (dB)")
+        self.axes_s21.set_xlim(MIN_FREQ/1e9, MAX_FREQ/1e9)
+        self.axes_s21.set_ylabel("dB")
+        self.axes_s21.grid(True)
 
-        self.ax21.set_xlim(MIN_FREQ/1e9, MAX_FREQ/1e9)
-        self.ax21.set_ylabel("dB")
-  
-        self.ax21.grid(True)
+        self.freqs = np.arange(-AD_SAMPLING_FREQUENCY/2, AD_SAMPLING_FREQUENCY/2, AD_SAMPLING_FREQUENCY / fft_size)
+        self.fft_line, = self.axes_fft.plot([], [], 'b-', lw=1.2, label='fft plot')
+        self.axes_fft.set_title("frequency")
+        self.axes_fft.set_xlim(-AD_SAMPLING_FREQUENCY/200, AD_SAMPLING_FREQUENCY/200)
+        # self.axes_fft.set_ylim(-120,-50)
+        self.axes_fft.set_ylabel("dB")
+        self.axes_fft.grid(True)
+
 
         self.canvas.mpl_connect('button_press_event', self._on_click)
         self.markers = []
@@ -305,7 +351,7 @@ class VNA(QMainWindow):
 
     # --- worker startup ---
     def _spawn_worker(self):
-        self.wk = SweepThread(sdr)
+        self.wk = SweepThread(sdr1, sdr2)
         self.wk.update.connect(self._update_plot)
         self.wk.reset_signal.connect(self._reset)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
@@ -328,7 +374,7 @@ class VNA(QMainWindow):
         self.wk.set_span(f0, f1, n)
         self.wk.stop_flag = False
         self.wk.start()
-        self.ax21.set_xlim(f0/1e9, f1/1e9)
+        self.axes_s21.set_xlim(f0/1e9, f1/1e9)
         self.canvas.draw()
 
     def _scan_finished(self):
@@ -351,8 +397,8 @@ class VNA(QMainWindow):
         self._clear_markers()
         self.canvas.draw()
 
-    def _update_plot(self, f, s21):
-        fGHz = f/1e9
+    def _update_plot(self, f_vco_hz, s21):
+        fGHz = f_vco_hz/1e9
         self.freq_label.setText(f"Freq:{fGHz*1000}MHz")
         if self.first_plot:
             x_data = self.x21
@@ -377,8 +423,14 @@ class VNA(QMainWindow):
         s21_plot_line.set_data(x_data, smooth_trace(np.array(y_data), SMOOTH_WIN21))
         s21_plot_dot.set_data(x_data, y_data)
 
-        self.ax21.relim(); 
-        self.ax21.autoscale_view(scalex=False)
+        self.axes_s21.relim(); 
+        self.axes_s21.autoscale_view(scalex=False)
+     
+        global fft_magnitude_db
+        self.fft_line.set_data(self.freqs, fft_magnitude_db)
+
+        self.axes_fft.relim(); 
+        self.axes_fft.autoscale_view(scalex=False)
 
         self.canvas.draw_idle()
         self.point_index  += 1
@@ -399,11 +451,11 @@ class VNA(QMainWindow):
         self.markers.clear()
 
     def _on_click(self, event):
-        # if event.inaxes not in (self.ax21):
+        # if event.inaxes not in (self.axes_s21):
         #     return
         ax = event.inaxes
         if event.button == 1:
-            # if ax is self.ax21:
+            # if ax is self.axes_s21:
             xdata = self.x21
             ydata = self.y21r if self.d21.get_visible() else list(self.l21.get_ydata())
             if not xdata:
@@ -437,14 +489,18 @@ class VNA(QMainWindow):
                 return None
             dlg.setValue(i); QApplication.processEvents()
             NUM_R = 4 if f < 1e9 else 1
-            sdr.tx_lo = sdr.rx_lo = int(f); time.sleep(DWELL)
+            sdr1.tx_lo = int(f)
+            sdr2.rx_lo = int(f); 
+            
+            time.sleep(DWELL)
             for _ in range(CLR_READS):
-                sdr.rx()
+                sdr2.rx()
             acc = np.zeros(SAMPLE_BUFFER_SIZE*NUM_R, np.complex64)
             for j in range(NUM_R):
-                r = sdr.rx()
+                r = sdr2.rx()
                 acc[j*SAMPLE_BUFFER_SIZE:(j+1)*SAMPLE_BUFFER_SIZE] = (r/2**12)
             A = lockin(acc)
+            print(f"Calpoint f:{f} value: {to_dB(A)}dB")
             out['freqs'].append(f)
             out['linear'].append(A)
             out['db'].append(to_dB(A))
@@ -469,7 +525,7 @@ class VNA(QMainWindow):
     # --- cleanup ---
     def closeEvent(self, e):
         self.wk.stop(); self.wk.wait()
-        sdr.tx_destroy_buffer(); sdr.rx_destroy_buffer()
+        sdr1.tx_destroy_buffer(); sdr1.rx_destroy_buffer()
         e.accept()
 
 # ───────────── main ─────────────
