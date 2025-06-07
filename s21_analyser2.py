@@ -3,6 +3,7 @@ import sys, os, time, traceback
 import numpy as np
 import pandas as pd
 import matplotlib
+import signal
 matplotlib.use("qtagg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import (
@@ -18,11 +19,11 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 # ───────────── configuration constants ─────────────
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
 FILT_RIPPLE_DB = 70
-FILT_CUTOFF_HZ = 5_000
+FILT_CUTOFF_HZ = 10_000
 FILT_TRANS_WIDTH_HZ = 100
 DEFAULT_STEPS, CAL_POINTS = 500, 500
 SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
-AD_SAMPLING_FREQUENCY = 10e6
+AD_SAMPLING_FREQUENCY = 8e6
 SAMPLE_BUFFER_SIZE = 500_000
 TX_TONE_FREQ = 100_000
 RF_FILTER_BANDWIDTH=1e6
@@ -53,7 +54,7 @@ sdr2.sample_rate             = int(AD_SAMPLING_FREQUENCY)
 sdr2.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
 sdr2.rx_buffer_size          = SAMPLE_BUFFER_SIZE
 sdr2.gain_control_mode_chan0 = "manual"
-sdr2.rx_hardwaregain_chan0   = 20
+sdr2.rx_hardwaregain_chan0   = 0
 sdr2.tx_hardwaregain_chan0   = -89
 sdr2._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
 sdr2._set_iio_dev_attr_str("xo_correction", 40000000-380)
@@ -147,6 +148,8 @@ class Point():
         fft_iq_buffer = iq_filtered[samples-fft_size:]
 
         global fft_magnitude_db
+        fft_iq_buffer = fft_iq_buffer * np.hamming(fft_size)
+
         fft_bins = np.fft.fftshift(np.fft.fft(fft_iq_buffer))/(fft_size)
         magnitude = np.abs(fft_bins)
         fft_magnitude_db = 20*np.log10(magnitude)
@@ -244,9 +247,11 @@ class VNA(QMainWindow):
         self._build_ui()
         self._init_plot()
         self._spawn_worker()
+        signal.signal(signal.SIGINT, self.sig_int)
 
         if os.path.exists('cal_s21.npz'):
             self.load_s21()
+
 
     # --- UI bar + checkboxes ---
     def _build_ui(self):
@@ -491,15 +496,16 @@ class VNA(QMainWindow):
         out = {'freqs': [], 'db': []}
         dlg = QProgressDialog(msg, "Cancel", 0, len(freqs), self)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal); dlg.show()
+        point = Point(sdr1, sdr2)
         for i, f in enumerate(freqs):
             if dlg.wasCanceled():
                 return None
             dlg.setValue(i); QApplication.processEvents()
           
-            # s21_point=
-            # print(f"Calpoint f:{f} value: {s21_point}dB")
-            # out['freqs'].append(f)
-            # out['db'].append(s21_point)
+            s21_point= point.get(f)
+            print(f"Calpoint f:{f} value: {s21_point}dB")
+            out['freqs'].append(f)
+            out['db'].append(s21_point)
         dlg.close()
         return {k: np.array(v) for k, v in out.items()}
 
@@ -518,10 +524,18 @@ class VNA(QMainWindow):
         self.wk.load_cal21({'freqs': d['freqs'], 'db': d['db']})
         print("S21 calibration loaded")
 
+    def sig_int(self, signum, frame):
+        self._close()
+        self.close()
+
+    def _close(self):
+        self.wk.stop()
+        self.wk.wait()
+        sdr1.tx_destroy_buffer()
+        sdr1.rx_destroy_buffer()
     # --- cleanup ---
     def closeEvent(self, e):
-        self.wk.stop(); self.wk.wait()
-        sdr1.tx_destroy_buffer(); sdr1.rx_destroy_buffer()
+        self._close()
         e.accept()
 
 # ───────────── main ─────────────
