@@ -24,11 +24,23 @@ FILT_TRANS_WIDTH_HZ = 100
 DEFAULT_STEPS, CAL_POINTS = 500, 500
 SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
 AD_SAMPLING_FREQUENCY = 8e6
-SAMPLE_BUFFER_SIZE = 500_000
 TX_TONE_FREQ = 100_000
 RF_FILTER_BANDWIDTH=1e6
 DWELL, CLR_READS, EPS = 0.1, 1, 1e-15
 MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
+
+TX_BUFFER_SIZE = 1_000
+
+# ───────────── FIR filter for lock-in ─────────────
+nyq     = AD_SAMPLING_FREQUENCY / 2
+N, beta = kaiserord(FILT_RIPPLE_DB, FILT_TRANS_WIDTH_HZ/nyq)
+b_fir   = firwin(N, FILT_CUTOFF_HZ/nyq, window=('kaiser', beta))
+
+fft_size = 4096*8
+fft_magnitude_db = None
+rx_buffer_size = fft_size+N
+print(f"Fir taps: {N}")
+print(f"Samples buffer size: {rx_buffer_size}")
 
 # ───────────── hardware initialisation ─────────────
 
@@ -36,14 +48,14 @@ MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 sdr1 = adi.ad9361("ip:192.168.2.137")
 sdr1.tx_enabled_channels     = [1]
 sdr1.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr1.tx_buffer_size          = 100_000
+sdr1.tx_buffer_size          = TX_BUFFER_SIZE
 sdr1.tx_cyclic_buffer        = True
 sdr1.tx_hardwaregain_chan0   = -3
 
 #this is not  used in sdr1 but I think should be configured to be in known state
 sdr1.sample_rate             = int(AD_SAMPLING_FREQUENCY)
 sdr1.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr1.rx_buffer_size          = SAMPLE_BUFFER_SIZE
+sdr1.rx_buffer_size          = rx_buffer_size
 sdr1.gain_control_mode_chan0 = "manual"
 sdr1.rx_hardwaregain_chan0   = 0
 sdr1._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
@@ -52,28 +64,20 @@ SDR_URI = "ip:pluto.local"
 sdr2 = adi.Pluto(uri=SDR_URI)
 sdr2.sample_rate             = int(AD_SAMPLING_FREQUENCY)
 sdr2.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr2.rx_buffer_size          = SAMPLE_BUFFER_SIZE
+sdr2.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+sdr2.rx_buffer_size          = rx_buffer_size
 sdr2.gain_control_mode_chan0 = "manual"
-sdr2.rx_hardwaregain_chan0   = 0
+sdr2.rx_hardwaregain_chan0   = 20
 sdr2.tx_hardwaregain_chan0   = -89
 sdr2._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
 sdr2._set_iio_dev_attr_str("xo_correction", 40000000-380)
 print(f"XO correcton: {sdr2._get_iio_dev_attr("xo_correction")}")
 
-_t = np.arange(10_000) / AD_SAMPLING_FREQUENCY
+_t = np.arange(TX_BUFFER_SIZE) / AD_SAMPLING_FREQUENCY
 tx_samples = (0.5*np.exp(2j * np.pi * TX_TONE_FREQ * _t)).astype(np.complex64)
 tx_samples *= 2**14 
 sdr1.tx(tx_samples)
 
-
-# ───────────── FIR filter for lock-in ─────────────
-nyq     = AD_SAMPLING_FREQUENCY / 2
-N, beta = kaiserord(FILT_RIPPLE_DB, FILT_TRANS_WIDTH_HZ/nyq)
-b_fir   = firwin(N, FILT_CUTOFF_HZ/nyq, window=('kaiser', beta))
-print(f"Fir taps: {N}")
-print(f"Samples buffer size: {SAMPLE_BUFFER_SIZE}")
-if SAMPLE_BUFFER_SIZE < N:
-    print("WARNING Samples buffer should be higher then filter taps count")
 
 def apply_filter(x):
     if FILTER_MODE == 'direct':
@@ -104,9 +108,6 @@ def smooth_trace(y, k):
     out[good] = num[good] / den[good]
     return out
 
-fft_size = 4096*8
-fft_magnitude_db = None
-
 class Point():
     def __init__(self, dev_tx, dev_rx):
         self.dev_tx = dev_tx
@@ -136,19 +137,17 @@ class Point():
             self.stop_flag = True
             return None
 
-
-        iq_buffer = np.zeros(SAMPLE_BUFFER_SIZE, np.complex64)
         iq_buffer = self._safe_rx()/(2**12)
         print(f"Freqpoint: {frequency_hz}")
 
         iq_filtered = apply_filter(iq_buffer)
         iq_filtered = iq_filtered[N:]  # discard FIR transient
 
-        samples = iq_filtered.size
-        fft_iq_buffer = iq_filtered[samples-fft_size:]
+        # samples = iq_filtered.size
+        # fft_iq_buffer = iq_filtered[samples-fft_size:]
 
         global fft_magnitude_db
-        fft_iq_buffer = fft_iq_buffer * np.hamming(fft_size)
+        fft_iq_buffer = iq_filtered * np.hamming(fft_size)
 
         fft_bins = np.fft.fftshift(np.fft.fft(fft_iq_buffer))/(fft_size)
         magnitude = np.abs(fft_bins)
