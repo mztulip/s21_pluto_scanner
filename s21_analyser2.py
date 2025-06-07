@@ -67,7 +67,8 @@ sdr2.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
 sdr2.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
 sdr2.rx_buffer_size          = rx_buffer_size
 sdr2.gain_control_mode_chan0 = "manual"
-sdr2.rx_hardwaregain_chan0   = 20
+RX_HARDWARE_GAIN = 20
+sdr2.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
 sdr2.tx_hardwaregain_chan0   = -89
 sdr2._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
 sdr2._set_iio_dev_attr_str("xo_correction", 40000000-380)
@@ -124,6 +125,8 @@ class Point():
         try:
             self.dev_tx.tx_lo = int(frequency_hz)
             self.dev_rx.rx_lo = int(frequency_hz)
+            #Necessary because someitmes without control it jumps to 73dB
+            self.dev_rx.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
         except Exception as e:
             print(f"SDR tune error: {e}")
             return None
@@ -162,17 +165,18 @@ class Point():
 # ───────────── worker thread ─────────────
 class SweepThread(QThread):
     update  = pyqtSignal(float, float)
-    reset_signal = pyqtSignal()
     scan_finished = pyqtSignal()
     trigger_start_signal = pyqtSignal()
     error   = pyqtSignal(str)
     pause_signal = pyqtSignal(bool)
 
-    def __init__(self, dev_tx, dev_rx):
+    def __init__(self, dev_tx, dev_rx, f_start, f_end, steps):
         super().__init__()
         self.dev_tx = dev_tx
         self.dev_rx = dev_rx
-        self.f0, self.f1, self.n = MIN_FREQ, MAX_FREQ, DEFAULT_STEPS
+        self.f0 = f_start
+        self.f1 = f_end
+        self.n = steps
         self.stop_flag = False
         self.cal21     = None
         self.trigger_start = False
@@ -187,9 +191,6 @@ class SweepThread(QThread):
         print("Start trigger emmited")
         self.trigger_start = True
 
-    def set_span(self, f0, f1, n):
-        self.f0, self.f1, self.n = f0, f1, n
-
     def stop(self):
         self.stop_flag = True
 
@@ -198,55 +199,66 @@ class SweepThread(QThread):
         print(f"Loaded cals: {d}")
 
     def run(self):
-        time.sleep(SWEEP_INIT_DELAY)
-        self.reset_signal.emit()
-        point = Point(self.dev_tx, self.dev_rx)
-        while not self.stop_flag:
-            while self.trigger_start is False:
-                print("Waiting for start trigger")
-                if self.stop_flag:
-                    return
-                time.sleep(1)
-            self.trigger_start = False
-            freqs = np.linspace(self.f0, self.f1, self.n)
-            freq_index = 0
-            
-            while freq_index < len(freqs):
-                i = freq_index
-                f = freqs[i]
-                if self.stop_flag or self.trigger_start is True:
-                    break
+        print("Worker run started")
         
-                s21 = point.get(f)
-                if s21 is None:
-                    self.stop_flag = True
-                    break
+        time.sleep(SWEEP_INIT_DELAY)
+        point = Point(self.dev_tx, self.dev_rx)
 
-                offset = None
-                if self.cal21 is not None:
-                    offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
-                    s21 -= offset
-                rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
-                print(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
+        print("Worker while loop begin")
+        while self.trigger_start is False:
+            print("Waiting for start trigger")
+            if self.stop_flag:
+                self.trigger_start = False
+                return
+            time.sleep(1)
+        self.trigger_start = False
 
-                self.update.emit(f, s21)
+        freqs = np.linspace(self.f0, self.f1, self.n)
+        freq_index = 0
+        
+        while freq_index < len(freqs):
+            i = freq_index
+            f = freqs[i]
+            if self.stop_flag or self.trigger_start is True:
+                print("Trigger start true, starting from beginning")
+                break
+    
+            s21 = point.get(f)
+            if s21 is None:
+                print("Getting point failed exiting")
+                self.stop_flag = True
+                return
 
-                if self.scan_paused is False:
-                    freq_index += 1
+            offset = None
+            if self.cal21 is not None:
+                offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
+                s21 -= offset
+            rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
+            print(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
 
-            self.scan_finished.emit()
-            if not self.stop_flag:
-                time.sleep(1)
+            self.update.emit(f, s21)
+
+            if self.scan_paused is False:
+                freq_index += 1
+
+        self.scan_finished.emit()
+
 
 # ───────────── GUI with toggles + markers ─────────────
 class VNA(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PlutoSDR VNA Pro – interactive")
+        self.freq_start = MIN_FREQ
+        self.freq_stop = MAX_FREQ
+        self.steps = DEFAULT_STEPS
+
+        self.setWindowTitle("2 pluto device scalar analyser")
         self._build_ui()
         self._init_plot()
         self._spawn_worker()
+        self.wk.trigger_start_signal.emit()
         signal.signal(signal.SIGINT, self.sig_int)
+ 
 
         if os.path.exists('cal_s21.npz'):
             self.load_s21()
@@ -329,23 +341,32 @@ class VNA(QMainWindow):
         self.wk.pause_signal.emit(False)
 
     def _start_from_beginning(self):
-        self._reset()
+        self.wk.stop()
+        print("Waiting for worker to stop")
+        self.wk.wait()
+        print("Worker stopped")
+        self.wk.scan_finished.disconnect()
+        self.wk.update.disconnect()
+        self._reset_plot()
+        self.first_plot = True
+        print("Start from beginning")
+        self._spawn_worker()
         self.wk.trigger_start_signal.emit()
 
     # --- traces + markers storage + titles ---
     def _init_plot(self):
         self.first_plot = True
-        self.x21, self.y21r = [], []
-        self.x21_freq, self.y21_value = [], []
+        self.first_data_x_s21, self.first_data_y_s21 = [], []
+        self.data_x21_freq, self.data_y21_value = [], []
 
-        self.l21, = self.axes_s21.plot([], [], 'b-', lw=1.2, label='S21 smoothed')
-        self.d21, = self.axes_s21.plot([], [], 'ro', ms=4,   label='S21 raw')
+        self.first_line_21, = self.axes_s21.plot([], [], 'b-', lw=1.2, label='S21 smoothed')
+        self.first_dots_21, = self.axes_s21.plot([], [], 'ro', ms=4,   label='S21 raw')
 
         self.s21_line_continuous, = self.axes_s21.plot([], [], 'y-', lw=1.2, label='S21 smoothed2')
         self.s21_dots_continuous, = self.axes_s21.plot([], [], 'go', ms=4,   label='S21 raw2')
 
         self.axes_s21.set_title("S21 (dB)")
-        self.axes_s21.set_xlim(MIN_FREQ/1e9, MAX_FREQ/1e9)
+        self.axes_s21.set_xlim(self.freq_start/1e9, self.freq_stop/1e9)
         self.axes_s21.set_ylabel("dB")
         self.axes_s21.grid(True)
 
@@ -365,48 +386,57 @@ class VNA(QMainWindow):
 
     # --- worker startup ---
     def _spawn_worker(self):
-        self.wk = SweepThread(sdr1, sdr2)
+        self.wk = SweepThread(sdr1, sdr2, self.freq_start, self.freq_stop, self.steps)
+        self.load_s21()
         self.wk.update.connect(self._update_plot)
-        self.wk.reset_signal.connect(self._reset)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
         self.wk.scan_finished.connect(self._scan_finished)
         self.wk.start()
-        self.wk.trigger_start_signal.emit()
 
     # --- span handling ---
     def apply_span(self):
         try:
-            f0 = float(self.le0.text())*1e6
-            f1 = float(self.le1.text())*1e6
-            n  = int(self.leN.text())
-            if not (MIN_FREQ <= f0 < f1 <= MAX_FREQ and n >= 2):
+            self.freq_start = float(self.le0.text())*1e6
+            self.freq_stop = float(self.le1.text())*1e6
+            self.steps  = int(self.leN.text())
+            if not (MIN_FREQ <= self.freq_start < self.freq_stop <= MAX_FREQ and self.steps >= 2):
                 raise ValueError
         except ValueError:
             print("Span input error")
             return
-        self.wk.stop(); self.wk.wait()
-        self.wk.set_span(f0, f1, n)
+
+        self.wk.stop(); 
+        self.wk.wait()
+        self.wk.scan_finished.disconnect()
+        self.wk.update.disconnect()
+        self._reset_plot()
+        self._spawn_worker()
+        self.wk.trigger_start_signal.emit()
         self.wk.stop_flag = False
         self.wk.start()
-        self.axes_s21.set_xlim(f0/1e9, f1/1e9)
+        self.axes_s21.set_xlim(self.freq_start/1e9, self.freq_stop/1e9)
         self.canvas.draw()
 
     def _scan_finished(self):
         print("Scan finished")
         self.point_index = 0
         self.first_plot = False
+        print("first_plot set to false")
+        self.wk.scan_finished.disconnect()
+        self.wk.update.disconnect()
         if not self.checkbox_single.isChecked():
+            self._spawn_worker()
             self.wk.trigger_start_signal.emit()
 
-    def _reset(self):
+    def _reset_plot(self):
         self.point_index = 0
-        self.x21.clear()
-        self.y21r.clear()
+        self.first_data_x_s21.clear()
+        self.first_data_y_s21.clear()
 
-        self.x21_freq.clear()
-        self.y21_value.clear()
+        self.data_x21_freq.clear()
+        self.data_y21_value.clear()
 
-        for ln in (self.l21, self.d21):
+        for ln in (self.first_line_21, self.first_dots_21, self.s21_line_continuous, self.s21_dots_continuous):
             ln.set_data([], [])
         self._clear_markers()
         self.canvas.draw()
@@ -415,14 +445,14 @@ class VNA(QMainWindow):
         fGHz = f_vco_hz/1e9
         self.freq_label.setText(f"Freq:{fGHz*1000}MHz")
         if self.first_plot:
-            x_data = self.x21
-            y_data = self.y21r
-            s21_plot_line = self.l21
-            s21_plot_dot = self.d21
+            x_data = self.first_data_x_s21
+            y_data = self.first_data_y_s21
+            s21_plot_line = self.first_line_21
+            s21_plot_dot = self.first_dots_21
             print("First plot")
         else:
-            x_data = self.x21_freq
-            y_data = self.y21_value
+            x_data = self.data_x21_freq
+            y_data = self.data_y21_value
             s21_plot_line = self.s21_line_continuous
             s21_plot_dot = self.s21_dots_continuous
             print("Not first plot")
@@ -453,8 +483,8 @@ class VNA(QMainWindow):
     def _vis_toggle(self):
         showS = self.cbSmooth.isChecked()
         showR = self.cbRaw.isChecked()
-        self.l21.set_visible(showS); 
-        self.d21.set_visible(showR); 
+        self.first_line_21.set_visible(showS); 
+        self.first_dots_21.set_visible(showR); 
         self.s21_line_continuous.set_visible(showS); 
         self.s21_dots_continuous.set_visible(showR); 
         self.canvas.draw_idle()
@@ -467,8 +497,8 @@ class VNA(QMainWindow):
     def _on_click(self, event):
         ax = event.inaxes
         if event.button == 1:
-            xdata = self.x21
-            ydata = self.y21r if self.d21.get_visible() else list(self.l21.get_ydata())
+            xdata = self.first_data_x_s21
+            ydata = self.first_data_y_s21 if self.first_dots_21.get_visible() else list(self.first_line_21.get_ydata())
             if not xdata:
                 return
             idx = int(np.argmin(np.abs(np.array(xdata) - event.xdata)))
