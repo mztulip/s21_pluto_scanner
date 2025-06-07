@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+cal_s21.npz
 # C extensions
 *.so
 
