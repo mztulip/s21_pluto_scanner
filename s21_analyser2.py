@@ -19,14 +19,14 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 # ───────────── configuration constants ─────────────
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
 FILT_RIPPLE_DB = 70
-FILT_CUTOFF_HZ = 10_000
+FILT_CUTOFF_HZ = 12_000
 FILT_TRANS_WIDTH_HZ = 100
 DEFAULT_STEPS, CAL_POINTS = 500, 500
 SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
 AD_SAMPLING_FREQUENCY = 8e6
 TX_TONE_FREQ = 100_000
 RF_FILTER_BANDWIDTH=1e6
-DWELL, CLR_READS, EPS = 0.1, 1, 1e-15
+DWELL, CLR_READS, EPS = 0.2, 2, 1e-15
 MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 
 TX_BUFFER_SIZE = 1_000
@@ -61,13 +61,14 @@ sdr1.rx_hardwaregain_chan0   = 0
 sdr1._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
 
 SDR_URI = "ip:pluto.local"
+# SDR_URI = "ip:192.168.2.121"
 sdr2 = adi.Pluto(uri=SDR_URI)
 sdr2.sample_rate             = int(AD_SAMPLING_FREQUENCY)
 sdr2.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
 sdr2.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
 sdr2.rx_buffer_size          = rx_buffer_size
 sdr2.gain_control_mode_chan0 = "manual"
-RX_HARDWARE_GAIN = 20
+RX_HARDWARE_GAIN = 30
 sdr2.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
 sdr2.tx_hardwaregain_chan0   = -89
 sdr2._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
@@ -121,7 +122,7 @@ class Point():
             print(f"SDR RX error: {e}")
             raise
 
-    def get(self, frequency_hz):
+    def get(self, frequency_hz, delay = 0):
         try:
             self.dev_tx.tx_lo = int(frequency_hz)
             self.dev_rx.rx_lo = int(frequency_hz)
@@ -131,7 +132,7 @@ class Point():
             print(f"SDR tune error: {e}")
             return None
 
-        time.sleep(DWELL)
+        time.sleep(DWELL + delay)
         try:
             for _ in range(CLR_READS):
                 self._safe_rx()
@@ -144,10 +145,8 @@ class Point():
         print(f"Freqpoint: {frequency_hz}")
 
         iq_filtered = apply_filter(iq_buffer)
+        # iq_filtered = iq_buffer
         iq_filtered = iq_filtered[N:]  # discard FIR transient
-
-        # samples = iq_filtered.size
-        # fft_iq_buffer = iq_filtered[samples-fft_size:]
 
         global fft_magnitude_db
         fft_iq_buffer = iq_filtered * np.hamming(fft_size)
@@ -222,8 +221,13 @@ class SweepThread(QThread):
             if self.stop_flag or self.trigger_start is True:
                 print("Trigger start true, starting from beginning")
                 break
-    
-            s21 = point.get(f)
+
+            # Delay is necessary when changging from end to begining
+            # without it first point is inccorect have lower power
+            delay = 0
+            if freq_index == 0:
+                delay = 1
+            s21 = point.get(f, delay)
             if s21 is None:
                 print("Getting point failed exiting")
                 self.stop_flag = True
@@ -322,6 +326,7 @@ class VNA(QMainWindow):
         h_box1.addWidget(self.freq_label)
 
         self.fig, (self.axes_s21, self.axes_fft) = plt.subplots(2,1, figsize=(12,9))
+        # self.axes_fft.axis('off')
         self.canvas = FigureCanvas(self.fig)
         box1.addWidget(self.canvas)
         box1.addWidget(NavigationToolbar2QT(self.canvas, self))
@@ -387,7 +392,8 @@ class VNA(QMainWindow):
     # --- worker startup ---
     def _spawn_worker(self):
         self.wk = SweepThread(sdr1, sdr2, self.freq_start, self.freq_stop, self.steps)
-        self.load_s21()
+        if os.path.exists('cal_s21.npz'):
+            self.load_s21()
         self.wk.update.connect(self._update_plot)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
         self.wk.scan_finished.connect(self._scan_finished)
@@ -412,8 +418,8 @@ class VNA(QMainWindow):
         self._reset_plot()
         self._spawn_worker()
         self.wk.trigger_start_signal.emit()
-        self.wk.stop_flag = False
-        self.wk.start()
+        # self.wk.stop_flag = False
+        # self.wk.start()
         self.axes_s21.set_xlim(self.freq_start/1e9, self.freq_stop/1e9)
         self.canvas.draw()
 
@@ -540,13 +546,20 @@ class VNA(QMainWindow):
 
     # --- S21 helpers ---
     def cal_s21(self):
-        self.wk.stop(); self.wk.wait()
+        self.wk.stop()
+        self.wk.wait()
+        self.wk.scan_finished.disconnect()
+        self.wk.update.disconnect()
+        self._reset_plot()
         data = self._do_cal("Calibrating S21…")
         if data is not None:
             np.savez("cal_s21.npz", **data)
             self.load_s21()
-        self.wk.stop_flag = False
-        self.wk.start()
+        # self.wk.stop_flag = False
+
+        # self.wk.start()
+        self._spawn_worker()
+        self.wk.trigger_start_signal.emit()
 
     def load_s21(self):
         d = np.load("cal_s21.npz")
