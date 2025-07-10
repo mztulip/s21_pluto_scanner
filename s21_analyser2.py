@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
     QFrame, QProgressDialog, QMessageBox, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 
 # ───────────── configuration constants ─────────────
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
@@ -31,6 +31,8 @@ MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 
 TX_BUFFER_SIZE = 1_000
 
+RX_HARDWARE_GAIN = 30
+
 # ───────────── FIR filter for lock-in ─────────────
 nyq     = AD_SAMPLING_FREQUENCY / 2
 N, beta = kaiserord(FILT_RIPPLE_DB, FILT_TRANS_WIDTH_HZ/nyq)
@@ -41,45 +43,6 @@ fft_magnitude_db = None
 rx_buffer_size = fft_size+N
 print(f"Fir taps: {N}")
 print(f"Samples buffer size: {rx_buffer_size}")
-
-# ───────────── hardware initialisation ─────────────
-
-# sdr1 = adi.Pluto("ip:192.168.2.137")
-sdr1 = adi.ad9361("ip:192.168.2.137")
-sdr1.tx_enabled_channels     = [1]
-sdr1.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr1.tx_buffer_size          = TX_BUFFER_SIZE
-sdr1.tx_cyclic_buffer        = True
-sdr1.tx_hardwaregain_chan0   = -3
-
-#this is not  used in sdr1 but I think should be configured to be in known state
-sdr1.sample_rate             = int(AD_SAMPLING_FREQUENCY)
-sdr1.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr1.rx_buffer_size          = rx_buffer_size
-sdr1.gain_control_mode_chan0 = "manual"
-sdr1.rx_hardwaregain_chan0   = 0
-sdr1._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
-
-SDR_URI = "ip:pluto.local"
-# SDR_URI = "ip:192.168.2.121"
-sdr2 = adi.Pluto(uri=SDR_URI)
-sdr2.sample_rate             = int(AD_SAMPLING_FREQUENCY)
-sdr2.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr2.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
-sdr2.rx_buffer_size          = rx_buffer_size
-sdr2.gain_control_mode_chan0 = "manual"
-RX_HARDWARE_GAIN = 30
-sdr2.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
-sdr2.tx_hardwaregain_chan0   = -89
-sdr2._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
-sdr2._set_iio_dev_attr_str("xo_correction", 40000000-380)
-print(f"XO correcton: {sdr2._get_iio_dev_attr("xo_correction")}")
-
-_t = np.arange(TX_BUFFER_SIZE) / AD_SAMPLING_FREQUENCY
-tx_samples = (0.5*np.exp(2j * np.pi * TX_TONE_FREQ * _t)).astype(np.complex64)
-tx_samples *= 2**14 
-sdr1.tx(tx_samples)
-
 
 def apply_filter(x):
     if FILTER_MODE == 'direct':
@@ -183,6 +146,10 @@ class SweepThread(QThread):
         self.pause_signal.connect(self._pause_signal_handle)
         self.scan_paused = False
 
+    def update_devices(self, dev_tx, dev_rx):
+        self.dev_tx = dev_tx
+        self.dev_rx = dev_rx
+
     def _pause_signal_handle(self, paused: bool):
         self.scan_paused = paused
 
@@ -198,18 +165,33 @@ class SweepThread(QThread):
         print(f"Loaded cals: {d}")
 
     def run(self):
-        print("Worker run started")
-        
+        print("Worker run started")        
         time.sleep(SWEEP_INIT_DELAY)
-        point = Point(self.dev_tx, self.dev_rx)
+
+        point = None
+        wait_counter = 0
+        while True:
+            if self.stop_flag:
+                return
+            if wait_counter%20 == 0:
+                if self.dev_tx and self.dev_rx:
+                    point = Point(self.dev_tx, self.dev_rx)
+                    break
+            
+                print("Waiting for sdr devices")
+            time.sleep(0.1)
+            wait_counter+=1
 
         print("Worker while loop begin")
+        wait_counter = 0
         while self.trigger_start is False:
-            print("Waiting for start trigger")
+            if wait_counter%10 == 0:
+                print("Waiting for start trigger")
             if self.stop_flag:
                 self.trigger_start = False
                 return
-            time.sleep(1)
+            time.sleep(0.1)
+            wait_counter+=1
         self.trigger_start = False
 
         freqs = np.linspace(self.f0, self.f1, self.n)
@@ -252,9 +234,12 @@ class SweepThread(QThread):
 class VNA(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.exit_loops = False
         self.freq_start = MIN_FREQ
         self.freq_stop = MAX_FREQ
         self.steps = DEFAULT_STEPS
+        self.sdr_tx_device = None
+        self.sdr_rx_device = None
 
         self.setWindowTitle("2 pluto device scalar analyser")
         self._build_ui()
@@ -263,9 +248,75 @@ class VNA(QMainWindow):
         self.wk.trigger_start_signal.emit()
         signal.signal(signal.SIGINT, self.sig_int)
  
-
         if os.path.exists('cal_s21.npz'):
             self.load_s21()
+
+        self.device_check_timer=QTimer()
+        self.device_check_timer.timeout.connect(self.create_sdr_devices)
+        self.device_check_timer.start(1000)
+
+    def create_sdr_devices(self):
+        if not self.sdr_tx_device:
+            print("No TX SDR device creating new")
+            self.sdr_tx_device = self.create_tx_sdr_device()
+            self.wk.update_devices(self.sdr_tx_device, self.sdr_rx_device)
+
+        if not self.sdr_rx_device:
+            print("No RX SDR device creating new")
+            self.sdr_rx_device = self.create_rx_sdr_device()
+            self.wk.update_devices(self.sdr_tx_device, self.sdr_rx_device)
+
+    def create_tx_sdr_device(self):
+
+        while self.exit_loops is False:
+            try:
+                 # sdr_tx_device = adi.Pluto("ip:192.168.2.137")
+                sdr_tx_device = adi.ad9361("ip:192.168.2.137")
+                sdr_tx_device.tx_enabled_channels     = [1]
+                sdr_tx_device.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+                sdr_tx_device.tx_buffer_size          = TX_BUFFER_SIZE
+                sdr_tx_device.tx_cyclic_buffer        = True
+                sdr_tx_device.tx_hardwaregain_chan0   = -3
+
+                #this is not  used in sdr_tx_device but I think should be configured to be in known state
+                sdr_tx_device.sample_rate             = int(AD_SAMPLING_FREQUENCY)
+                sdr_tx_device.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+                sdr_tx_device.rx_buffer_size          = rx_buffer_size
+                sdr_tx_device.gain_control_mode_chan0 = "manual"
+                sdr_tx_device.rx_hardwaregain_chan0   = 0
+                sdr_tx_device._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
+                _t = np.arange(TX_BUFFER_SIZE) / AD_SAMPLING_FREQUENCY
+                tx_samples = (0.5*np.exp(2j * np.pi * TX_TONE_FREQ * _t)).astype(np.complex64)
+                tx_samples *= 2**14 
+                sdr_tx_device.tx(tx_samples)
+                return sdr_tx_device
+            
+            except Exception as e:
+                print(e)
+                print("TX SDR connection failed trying again")
+
+
+    def create_rx_sdr_device(self):
+        while self.exit_loops is False:
+            try:
+                SDR_URI = "ip:pluto.local"
+                # SDR_URI = "ip:192.168.2.121"
+                sdr_rx_device = adi.Pluto(uri=SDR_URI)
+                sdr_rx_device.sample_rate             = int(AD_SAMPLING_FREQUENCY)
+                sdr_rx_device.rx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+                sdr_rx_device.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
+                sdr_rx_device.rx_buffer_size          = rx_buffer_size
+                sdr_rx_device.gain_control_mode_chan0 = "manual"
+                sdr_rx_device.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
+                sdr_rx_device.tx_hardwaregain_chan0   = -89
+                sdr_rx_device._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
+                sdr_rx_device._set_iio_dev_attr_str("xo_correction", 40000000-380)
+                print(f"XO correcton: {sdr_rx_device._get_iio_dev_attr("xo_correction")}")
+                return sdr_rx_device
+
+            except Exception as e:
+                print(e)
+                print("RX SDR connection failed trying again")
 
 
     # --- UI bar + checkboxes ---
@@ -273,7 +324,6 @@ class VNA(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         box1 = QVBoxLayout(cw)
-
 
         top = QFrame()
         top.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
@@ -391,7 +441,7 @@ class VNA(QMainWindow):
 
     # --- worker startup ---
     def _spawn_worker(self):
-        self.wk = SweepThread(sdr1, sdr2, self.freq_start, self.freq_stop, self.steps)
+        self.wk = SweepThread(self.sdr_tx_device, self.sdr_rx_device, self.freq_start, self.freq_stop, self.steps)
         if os.path.exists('cal_s21.npz'):
             self.load_s21()
         self.wk.update.connect(self._update_plot)
@@ -531,7 +581,7 @@ class VNA(QMainWindow):
         out = {'freqs': [], 'db': []}
         dlg = QProgressDialog(msg, "Cancel", 0, len(freqs), self)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal); dlg.show()
-        point = Point(sdr1, sdr2)
+        point = Point(sdr_tx_device, sdr_rx_device)
         for i, f in enumerate(freqs):
             if dlg.wasCanceled():
                 return None
@@ -541,6 +591,8 @@ class VNA(QMainWindow):
             print(f"Calpoint f:{f} value: {s21_point}dB")
             out['freqs'].append(f)
             out['db'].append(s21_point)
+            if point < -60:
+                print(f"Warning: RX signal is below -60dB something is wrong freq:{f}")
         dlg.close()
         return {k: np.array(v) for k, v in out.items()}
 
@@ -555,9 +607,7 @@ class VNA(QMainWindow):
         if data is not None:
             np.savez("cal_s21.npz", **data)
             self.load_s21()
-        # self.wk.stop_flag = False
 
-        # self.wk.start()
         self._spawn_worker()
         self.wk.trigger_start_signal.emit()
 
@@ -567,14 +617,19 @@ class VNA(QMainWindow):
         print("S21 calibration loaded")
 
     def sig_int(self, signum, frame):
+        print("Ctrl+c pressed SIGINT received, exitting")
         self._close()
         self.close()
 
     def _close(self):
+        self.exit_loops = True
         self.wk.stop()
         self.wk.wait()
-        sdr1.tx_destroy_buffer()
-        sdr1.rx_destroy_buffer()
+        if self.sdr_tx_device:
+            self.sdr_tx_device.tx_destroy_buffer()
+        if self.sdr_tx_device:
+            self.sdr_tx_device.rx_destroy_buffer()
+
     # --- cleanup ---
     def closeEvent(self, e):
         self._close()
