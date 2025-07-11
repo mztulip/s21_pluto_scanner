@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import signal
+import logging
 matplotlib.use("qtagg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import (
@@ -15,6 +16,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
     QFrame, QProgressDialog, QMessageBox, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+
+log = logging.getLogger(__name__)
+logging.basicConfig(encoding='utf-8', level=logging.INFO)
 
 # ───────────── configuration constants ─────────────
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
@@ -82,30 +86,30 @@ class Point():
         try:
             return self.dev_rx.rx()
         except Exception as e:
-            print(f"SDR RX error: {e}")
-            raise
+            log.warning(f"SDR RX failed reading rx: {e}")
+            raise e
 
     def get(self, frequency_hz, delay = 0):
         try:
             self.dev_tx.tx_lo = int(frequency_hz)
+        except Exception as e:
+            log.warning(f"TX setting LO freq failed: {e}")
+            raise e
+        try:
             self.dev_rx.rx_lo = int(frequency_hz)
-            #Necessary because someitmes without control it jumps to 73dB
+            #Necessary because sometimes without control it jumps to 73dB
             self.dev_rx.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
         except Exception as e:
-            print(f"SDR tune error: {e}")
-            return None
+            log.warning(f"RX setting LO freq, gain failed: {e}")
+            raise e
 
         time.sleep(DWELL + delay)
-        try:
-            for _ in range(CLR_READS):
-                self._safe_rx()
 
-        except Exception as e:
-            self.stop_flag = True
-            return None
+        for _ in range(CLR_READS):
+            self._safe_rx()
 
         iq_buffer = self._safe_rx()/(2**12)
-        print(f"Freqpoint: {frequency_hz}")
+        log.info(f"Freqpoint: {frequency_hz}")
 
         iq_filtered = apply_filter(iq_buffer)
         # iq_filtered = iq_buffer
@@ -119,7 +123,7 @@ class Point():
         fft_magnitude_db = 20*np.log10(magnitude)
         freq_peak_index = np.argmax(fft_magnitude_db)
         s21 = fft_magnitude_db[freq_peak_index]
-        print(f"FFT Peak index: {freq_peak_index} Value:{s21}")  
+        log.info(f"FFT Peak index: {freq_peak_index} Value:{s21}")  
 
         return s21
 
@@ -131,11 +135,12 @@ class SweepThread(QThread):
     trigger_start_signal = pyqtSignal()
     error   = pyqtSignal(str)
     pause_signal = pyqtSignal(bool)
+    update_devices_signal = pyqtSignal(object, object)
 
-    def __init__(self, dev_tx, dev_rx, f_start, f_end, steps):
+    def __init__(self, f_start, f_end, steps):
         super().__init__()
-        self.dev_tx = dev_tx
-        self.dev_rx = dev_rx
+        self.dev_tx = None
+        self.dev_rx = None
         self.f0 = f_start
         self.f1 = f_end
         self.n = steps
@@ -144,17 +149,19 @@ class SweepThread(QThread):
         self.trigger_start = False
         self.trigger_start_signal.connect(self._trigger_start)
         self.pause_signal.connect(self._pause_signal_handle)
+        self.update_devices_signal.connect(self._update_devices)
         self.scan_paused = False
 
-    def update_devices(self, dev_tx, dev_rx):
+    def _update_devices(self, dev_tx, dev_rx):
         self.dev_tx = dev_tx
         self.dev_rx = dev_rx
+        log.debug(f"WK thread devices update {dev_tx} oraz {dev_rx}")
 
     def _pause_signal_handle(self, paused: bool):
         self.scan_paused = paused
 
     def _trigger_start(self):
-        print("Start trigger emmited")
+        log.info("Start trigger emmited")
         self.trigger_start = True
 
     def stop(self):
@@ -162,31 +169,17 @@ class SweepThread(QThread):
 
     def load_cal21(self, d):
         self.cal21 = d
-        print(f"Loaded cals: {d}")
+        log.info(f"Loaded cals: {d}")
 
     def run(self):
-        print("Worker run started")        
+        log.info("Worker run started")        
         time.sleep(SWEEP_INIT_DELAY)
 
-        point = None
-        wait_counter = 0
-        while True:
-            if self.stop_flag:
-                return
-            if wait_counter%20 == 0:
-                if self.dev_tx and self.dev_rx:
-                    point = Point(self.dev_tx, self.dev_rx)
-                    break
-            
-                print("Waiting for sdr devices")
-            time.sleep(0.1)
-            wait_counter+=1
-
-        print("Worker while loop begin")
+        log.info("Worker while loop begin")
         wait_counter = 0
         while self.trigger_start is False:
             if wait_counter%10 == 0:
-                print("Waiting for start trigger")
+                log.info("Waiting for start trigger")
             if self.stop_flag:
                 self.trigger_start = False
                 return
@@ -201,26 +194,49 @@ class SweepThread(QThread):
             i = freq_index
             f = freqs[i]
             if self.stop_flag or self.trigger_start is True:
-                print("Trigger start true, starting from beginning")
+                log.info("Trigger start true, starting from beginning")
                 break
+
+            point = None
+            wait_counter = 0
+            while True:
+                if self.stop_flag:
+                    return
+                
+                if self.dev_tx and self.dev_rx:
+                    point = Point(self.dev_tx, self.dev_rx)
+                    break
+
+                if wait_counter%20 == 0:
+                    log.warning("Waiting for sdr devices")
+                time.sleep(0.1)
+                wait_counter+=1
 
             # Delay is necessary when changging from end to begining
             # without it first point is inccorect have lower power
             delay = 0
             if freq_index == 0:
                 delay = 1
-            s21 = point.get(f, delay)
-            if s21 is None:
-                print("Getting point failed exiting")
-                self.stop_flag = True
-                return
+            try:
+                s21 = point.get(f, delay)
+
+            except Exception as e:
+                log.warning("Getting point failed")
+                self.dev_tx = None
+                self.dev_rx = None
+                continue
 
             offset = None
             if self.cal21 is not None:
                 offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
                 s21 -= offset
-            rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
-            print(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
+            try:
+                rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
+                log.info(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
+            except Exception as e:
+                log.warning("Getting RSSI failed")
+                self.dev_rx = None
+                continue
 
             self.update.emit(f, s21)
 
@@ -256,15 +272,27 @@ class VNA(QMainWindow):
         self.device_check_timer.start(1000)
 
     def create_sdr_devices(self):
-        if not self.sdr_tx_device:
+        self.device_check_timer.stop()
+        if not self.wk.dev_tx:
             print("No TX SDR device creating new")
+            self.sdr_tx_device = None
             self.sdr_tx_device = self.create_tx_sdr_device()
-            self.wk.update_devices(self.sdr_tx_device, self.sdr_rx_device)
+            self.wk.update_devices_signal.emit(self.sdr_tx_device, self.sdr_rx_device)
+        else:
+            print("Tx device present")
 
+        try:
+            self.wk.sdr_rx_device
+        except Exception:
+            self.sdr_rx_device = None
         if not self.sdr_rx_device:
             print("No RX SDR device creating new")
             self.sdr_rx_device = self.create_rx_sdr_device()
-            self.wk.update_devices(self.sdr_tx_device, self.sdr_rx_device)
+            self.wk.update_devices_signal.emit(self.sdr_tx_device, self.sdr_rx_device)
+        else:
+            print("Rx device present")
+
+        self.device_check_timer.start(1000)
 
     def create_tx_sdr_device(self):
 
@@ -289,6 +317,7 @@ class VNA(QMainWindow):
                 tx_samples = (0.5*np.exp(2j * np.pi * TX_TONE_FREQ * _t)).astype(np.complex64)
                 tx_samples *= 2**14 
                 sdr_tx_device.tx(tx_samples)
+                print("TX device created and configured")
                 return sdr_tx_device
             
             except Exception as e:
@@ -312,6 +341,7 @@ class VNA(QMainWindow):
                 sdr_rx_device._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
                 sdr_rx_device._set_iio_dev_attr_str("xo_correction", 40000000-380)
                 print(f"XO correcton: {sdr_rx_device._get_iio_dev_attr("xo_correction")}")
+                print("RX device created and configured")
                 return sdr_rx_device
 
             except Exception as e:
@@ -441,7 +471,7 @@ class VNA(QMainWindow):
 
     # --- worker startup ---
     def _spawn_worker(self):
-        self.wk = SweepThread(self.sdr_tx_device, self.sdr_rx_device, self.freq_start, self.freq_stop, self.steps)
+        self.wk = SweepThread(self.freq_start, self.freq_stop, self.steps)
         if os.path.exists('cal_s21.npz'):
             self.load_s21()
         self.wk.update.connect(self._update_plot)
