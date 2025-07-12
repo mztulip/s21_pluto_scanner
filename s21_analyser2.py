@@ -136,6 +136,8 @@ class SweepThread(QThread):
     error   = pyqtSignal(str)
     pause_signal = pyqtSignal(bool)
     update_devices_signal = pyqtSignal(object, object)
+    get_devs_request_signal = pyqtSignal()
+    get_devs_response_signal = pyqtSignal(object, object)
 
     def __init__(self, f_start, f_end, steps):
         super().__init__()
@@ -150,7 +152,11 @@ class SweepThread(QThread):
         self.trigger_start_signal.connect(self._trigger_start)
         self.pause_signal.connect(self._pause_signal_handle)
         self.update_devices_signal.connect(self._update_devices)
+        self.get_devs_request_signal.connect(self._emit_devs)
         self.scan_paused = False
+
+    def _emit_devs(self):
+        self.get_devs_response_signal.emit(self.dev_tx, self.dev_rx)
 
     def _update_devices(self, dev_tx, dev_rx):
         self.dev_tx = dev_tx
@@ -170,6 +176,9 @@ class SweepThread(QThread):
     def load_cal21(self, d):
         self.cal21 = d
         log.info(f"Loaded cals: {d}")
+
+    def _get_devices_handle(self):
+        pass
 
     def run(self):
         log.info("Worker run started")        
@@ -261,6 +270,7 @@ class VNA(QMainWindow):
         self._build_ui()
         self._init_plot()
         self._spawn_worker()
+        self.wk.get_devs_response_signal.connect(self._get_devices_signal_handle)
         self.wk.trigger_start_signal.emit()
         signal.signal(signal.SIGINT, self.sig_int)
  
@@ -268,29 +278,31 @@ class VNA(QMainWindow):
             self.load_s21()
 
         self.device_check_timer=QTimer()
-        self.device_check_timer.timeout.connect(self.create_sdr_devices)
+        self.device_check_timer.timeout.connect(self.check_create_sdr_devices)
         self.device_check_timer.start(1000)
 
-    def create_sdr_devices(self):
+    def _get_devices_signal_handle(self, rx_dev, tx_dev):
+        log.info("Received devs from working thread")
+        self.sdr_rx_device = rx_dev
+        self.sdr_tx_device = tx_dev
+
+    def get_devices(self):
+        self.wk.get_devs_request_signal.emit() 
+
+    def check_create_sdr_devices(self):
         self.device_check_timer.stop()
-        if not self.wk.dev_tx:
+
+        self.get_devices()
+    
+        if not self.sdr_rx_device:
             print("No TX SDR device creating new")
-            self.sdr_tx_device = None
             self.sdr_tx_device = self.create_tx_sdr_device()
             self.wk.update_devices_signal.emit(self.sdr_tx_device, self.sdr_rx_device)
-        else:
-            print("Tx device present")
 
-        try:
-            self.wk.sdr_rx_device
-        except Exception:
-            self.sdr_rx_device = None
         if not self.sdr_rx_device:
             print("No RX SDR device creating new")
             self.sdr_rx_device = self.create_rx_sdr_device()
             self.wk.update_devices_signal.emit(self.sdr_tx_device, self.sdr_rx_device)
-        else:
-            print("Rx device present")
 
         self.device_check_timer.start(1000)
 
@@ -339,7 +351,7 @@ class VNA(QMainWindow):
                 sdr_rx_device.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
                 sdr_rx_device.tx_hardwaregain_chan0   = -89
                 sdr_rx_device._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
-                sdr_rx_device._set_iio_dev_attr_str("xo_correction", 40000000-380)
+                sdr_rx_device._set_iio_dev_attr_str("xo_correction", 40000000-300)
                 print(f"XO correcton: {sdr_rx_device._get_iio_dev_attr("xo_correction")}")
                 print("RX device created and configured")
                 return sdr_rx_device
@@ -611,7 +623,7 @@ class VNA(QMainWindow):
         out = {'freqs': [], 'db': []}
         dlg = QProgressDialog(msg, "Cancel", 0, len(freqs), self)
         dlg.setWindowModality(Qt.WindowModality.ApplicationModal); dlg.show()
-        point = Point(sdr_tx_device, sdr_rx_device)
+        point = Point(self.sdr_tx_device, self.sdr_rx_device)
         for i, f in enumerate(freqs):
             if dlg.wasCanceled():
                 return None
@@ -621,7 +633,7 @@ class VNA(QMainWindow):
             print(f"Calpoint f:{f} value: {s21_point}dB")
             out['freqs'].append(f)
             out['db'].append(s21_point)
-            if point < -60:
+            if s21_point < -60:
                 print(f"Warning: RX signal is below -60dB something is wrong freq:{f}")
         dlg.close()
         return {k: np.array(v) for k, v in out.items()}
