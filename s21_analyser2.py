@@ -30,7 +30,7 @@ SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
 AD_SAMPLING_FREQUENCY = 8e6
 TX_TONE_FREQ = 100_000
 RF_FILTER_BANDWIDTH=1e6
-DWELL, CLR_READS, EPS = 0.2, 2, 1e-15
+DWELL, CLR_READS, EPS = 0.2, 5, 1e-15
 MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 
 TX_BUFFER_SIZE = 1_000
@@ -106,9 +106,14 @@ class Point():
         time.sleep(DWELL + delay)
 
         for _ in range(CLR_READS):
-            self._safe_rx()
+            data = self._safe_rx()
+            print(f"Clear data: {data}")
 
-        iq_buffer = self._safe_rx()/(2**12)
+        iq_buffer = self._safe_rx()
+        if type(iq_buffer) is list:
+            iq_buffer = iq_buffer[0]
+        print(iq_buffer)
+        iq_buffer /= (2**12)
         log.info(f"Freqpoint: {frequency_hz}")
 
         iq_filtered = apply_filter(iq_buffer)
@@ -139,7 +144,7 @@ class SweepThread(QThread):
     get_devs_request_signal = pyqtSignal()
     get_devs_response_signal = pyqtSignal(object, object)
 
-    def __init__(self, f_start, f_end, steps):
+    def __init__(self, dev_tx, dev_rx, f_start, f_end, steps):
         super().__init__()
         self.dev_tx = None
         self.dev_rx = None
@@ -156,6 +161,7 @@ class SweepThread(QThread):
         self.scan_paused = False
 
     def _emit_devs(self):
+        log.info("Worker: got devs request")
         self.get_devs_response_signal.emit(self.dev_tx, self.dev_rx)
 
     def _update_devices(self, dev_tx, dev_rx):
@@ -217,7 +223,7 @@ class SweepThread(QThread):
                     break
 
                 if wait_counter%20 == 0:
-                    log.warning("Waiting for sdr devices")
+                    log.warning("Worker: Waiting for sdr devices")
                 time.sleep(0.1)
                 wait_counter+=1
 
@@ -253,6 +259,7 @@ class SweepThread(QThread):
                 freq_index += 1
 
         self.scan_finished.emit()
+        log.info("Worker thread exited")
 
 
 # ───────────── GUI with toggles + markers ─────────────
@@ -270,7 +277,6 @@ class VNA(QMainWindow):
         self._build_ui()
         self._init_plot()
         self._spawn_worker()
-        self.wk.get_devs_response_signal.connect(self._get_devices_signal_handle)
         self.wk.trigger_start_signal.emit()
         signal.signal(signal.SIGINT, self.sig_int)
  
@@ -291,7 +297,7 @@ class VNA(QMainWindow):
 
     def check_create_sdr_devices(self):
         self.device_check_timer.stop()
-
+        log.info("Devices check")
         self.get_devices()
     
         if not self.sdr_rx_device:
@@ -483,13 +489,14 @@ class VNA(QMainWindow):
 
     # --- worker startup ---
     def _spawn_worker(self):
-        self.wk = SweepThread(self.freq_start, self.freq_stop, self.steps)
+        self.wk = SweepThread(self.sdr_tx_device, self.sdr_rx_device, self.freq_start, self.freq_stop, self.steps)
         if os.path.exists('cal_s21.npz'):
             self.load_s21()
         self.wk.update.connect(self._update_plot)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
         self.wk.scan_finished.connect(self._scan_finished)
         self.wk.start()
+        self.wk.get_devs_response_signal.connect(self._get_devices_signal_handle)
 
     # --- span handling ---
     def apply_span(self):
@@ -640,6 +647,8 @@ class VNA(QMainWindow):
 
     # --- S21 helpers ---
     def cal_s21(self):
+        log.info("Calibration started")
+        self.device_check_timer.stop()
         self.wk.stop()
         self.wk.wait()
         self.wk.scan_finished.disconnect()
