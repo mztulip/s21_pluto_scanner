@@ -77,6 +77,14 @@ def smooth_trace(y, k):
     out[good] = num[good] / den[good]
     return out
 
+
+class RxFailed(Exception):
+    pass
+
+
+class TxFailed(Exception):
+    pass
+
 class Point():
     def __init__(self, dev_tx, dev_rx):
         self.dev_tx = dev_tx
@@ -87,21 +95,21 @@ class Point():
             return self.dev_rx.rx()
         except Exception as e:
             log.warning(f"SDR RX failed reading rx: {e}")
-            raise e
+            raise RxFailed
 
     def get(self, frequency_hz, delay = 0):
         try:
             self.dev_tx.tx_lo = int(frequency_hz)
         except Exception as e:
             log.warning(f"TX setting LO freq failed: {e}")
-            raise e
+            raise TxFailed
         try:
             self.dev_rx.rx_lo = int(frequency_hz)
             #Necessary because sometimes without control it jumps to 73dB
             self.dev_rx.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
         except Exception as e:
             log.warning(f"RX setting LO freq, gain failed: {e}")
-            raise e
+            raise RxFailed
 
         time.sleep(DWELL + delay)
 
@@ -110,9 +118,9 @@ class Point():
             print(f"Clear data: {data}")
 
         iq_buffer = self._safe_rx()
-        if type(iq_buffer) is list:
-            iq_buffer = iq_buffer[0]
-        print(iq_buffer)
+        # if type(iq_buffer) is list:
+        #     iq_buffer = iq_buffer[0]
+        # print(iq_buffer)
         iq_buffer /= (2**12)
         log.info(f"Freqpoint: {frequency_hz}")
 
@@ -137,14 +145,15 @@ class Point():
 class SweepThread(QThread):
     update  = pyqtSignal(float, float)
     scan_finished = pyqtSignal()
-    trigger_start_signal = pyqtSignal()
+    trigger_start_signal = pyqtSignal(bool)
     error   = pyqtSignal(str)
     pause_signal = pyqtSignal(bool)
     update_devices_signal = pyqtSignal(object, object)
     get_devs_request_signal = pyqtSignal()
     get_devs_response_signal = pyqtSignal(object, object)
 
-    def __init__(self, dev_tx, dev_rx, f_start, f_end, steps):
+
+    def __init__(self, f_start, f_end, steps):
         super().__init__()
         self.dev_tx = None
         self.dev_rx = None
@@ -156,165 +165,48 @@ class SweepThread(QThread):
         self.trigger_start = False
         self.trigger_start_signal.connect(self._trigger_start)
         self.pause_signal.connect(self._pause_signal_handle)
-        self.update_devices_signal.connect(self._update_devices)
-        self.get_devs_request_signal.connect(self._emit_devs)
         self.scan_paused = False
+        self.calibrate = False
 
-    def _emit_devs(self):
-        log.info("Worker: got devs request")
-        self.get_devs_response_signal.emit(self.dev_tx, self.dev_rx)
-
-    def _update_devices(self, dev_tx, dev_rx):
-        self.dev_tx = dev_tx
-        self.dev_rx = dev_rx
-        log.debug(f"WK thread devices update {dev_tx} oraz {dev_rx}")
 
     def _pause_signal_handle(self, paused: bool):
         self.scan_paused = paused
 
-    def _trigger_start(self):
+
+    def _trigger_start(self, calibrate: bool):
         log.info("Start trigger emmited")
         self.trigger_start = True
+        self.calibrate = calibrate
+
 
     def stop(self):
         self.stop_flag = True
 
-    def load_cal21(self, d):
-        self.cal21 = d
-        log.info(f"Loaded cals: {d}")
 
-    def _get_devices_handle(self):
-        pass
-
-    def run(self):
-        log.info("Worker run started")        
-        time.sleep(SWEEP_INIT_DELAY)
-
-        log.info("Worker while loop begin")
-        wait_counter = 0
-        while self.trigger_start is False:
-            if wait_counter%10 == 0:
-                log.info("Waiting for start trigger")
-            if self.stop_flag:
-                self.trigger_start = False
-                return
-            time.sleep(0.1)
-            wait_counter+=1
-        self.trigger_start = False
-
-        freqs = np.linspace(self.f0, self.f1, self.n)
-        freq_index = 0
-        
-        while freq_index < len(freqs):
-            i = freq_index
-            f = freqs[i]
-            if self.stop_flag or self.trigger_start is True:
-                log.info("Trigger start true, starting from beginning")
-                break
-
-            point = None
-            wait_counter = 0
-            while True:
-                if self.stop_flag:
-                    return
-                
-                if self.dev_tx and self.dev_rx:
-                    point = Point(self.dev_tx, self.dev_rx)
-                    break
-
-                if wait_counter%20 == 0:
-                    log.warning("Worker: Waiting for sdr devices")
-                time.sleep(0.1)
-                wait_counter+=1
-
-            # Delay is necessary when changging from end to begining
-            # without it first point is inccorect have lower power
-            delay = 0
-            if freq_index == 0:
-                delay = 1
-            try:
-                s21 = point.get(f, delay)
-
-            except Exception as e:
-                log.warning("Getting point failed")
-                self.dev_tx = None
-                self.dev_rx = None
-                continue
-
-            offset = None
-            if self.cal21 is not None:
-                offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
-                s21 -= offset
-            try:
-                rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
-                log.info(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
-            except Exception as e:
-                log.warning("Getting RSSI failed")
-                self.dev_rx = None
-                continue
-
-            self.update.emit(f, s21)
-
-            if self.scan_paused is False:
-                freq_index += 1
-
-        self.scan_finished.emit()
-        log.info("Worker thread exited")
-
-
-# ───────────── GUI with toggles + markers ─────────────
-class VNA(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.exit_loops = False
-        self.freq_start = MIN_FREQ
-        self.freq_stop = MAX_FREQ
-        self.steps = DEFAULT_STEPS
-        self.sdr_tx_device = None
-        self.sdr_rx_device = None
-
-        self.setWindowTitle("2 pluto device scalar analyser")
-        self._build_ui()
-        self._init_plot()
-        self._spawn_worker()
-        self.wk.trigger_start_signal.emit()
-        signal.signal(signal.SIGINT, self.sig_int)
- 
+    def load_cal21(self):
         if os.path.exists('cal_s21.npz'):
-            self.load_s21()
-
-        self.device_check_timer=QTimer()
-        self.device_check_timer.timeout.connect(self.check_create_sdr_devices)
-        self.device_check_timer.start(1000)
-
-    def _get_devices_signal_handle(self, rx_dev, tx_dev):
-        log.info("Received devs from working thread")
-        self.sdr_rx_device = rx_dev
-        self.sdr_tx_device = tx_dev
-
-    def get_devices(self):
-        self.wk.get_devs_request_signal.emit() 
+            cal_data = np.load("cal_s21.npz")
+            log.info(f"Loaded cals: {cal_data}")
+            self.cal21 = {'freqs': cal_data['freqs'], 'db': cal_data['db']}
+            log.info("S21 calibration loaded")
+        else:
+            log.info("S21 calibration not present")
+            
 
     def check_create_sdr_devices(self):
-        self.device_check_timer.stop()
         log.info("Devices check")
-        self.get_devices()
     
-        if not self.sdr_rx_device:
+        if not self.dev_tx:
             print("No TX SDR device creating new")
-            self.sdr_tx_device = self.create_tx_sdr_device()
-            self.wk.update_devices_signal.emit(self.sdr_tx_device, self.sdr_rx_device)
-
-        if not self.sdr_rx_device:
+            self.dev_tx = self.create_tx_sdr_device()
+      
+        if not self.dev_rx:
             print("No RX SDR device creating new")
-            self.sdr_rx_device = self.create_rx_sdr_device()
-            self.wk.update_devices_signal.emit(self.sdr_tx_device, self.sdr_rx_device)
+            self.dev_rx = self.create_rx_sdr_device()
 
-        self.device_check_timer.start(1000)
 
     def create_tx_sdr_device(self):
-
-        while self.exit_loops is False:
+        while self.stop_flag is False:
             try:
                  # sdr_tx_device = adi.Pluto("ip:192.168.2.137")
                 sdr_tx_device = adi.ad9361("ip:192.168.2.137")
@@ -344,7 +236,7 @@ class VNA(QMainWindow):
 
 
     def create_rx_sdr_device(self):
-        while self.exit_loops is False:
+        while self.stop_flag is False:
             try:
                 SDR_URI = "ip:pluto.local"
                 # SDR_URI = "ip:192.168.2.121"
@@ -366,6 +258,133 @@ class VNA(QMainWindow):
                 print(e)
                 print("RX SDR connection failed trying again")
 
+
+    def check_devs(self):
+        point = None
+        wait_counter = 0
+        while True:
+            if self.stop_flag:
+                return
+            
+            if self.dev_tx and self.dev_rx:
+                point = Point(self.dev_tx, self.dev_rx)
+                break
+
+            if wait_counter%20 == 0:
+                log.warning("Worker: Waiting for sdr devices")
+            self.check_create_sdr_devices()
+            time.sleep(0.1)
+            wait_counter+=1
+        return point
+
+
+    def run(self):
+        log.info("Worker run started")
+        self.load_cal21()
+        self.check_create_sdr_devices()
+        time.sleep(SWEEP_INIT_DELAY)
+
+        log.info("Worker while loop begin")
+        wait_counter = 0
+        while self.trigger_start is False:
+            if wait_counter%10 == 0:
+                log.info("Waiting for start trigger")
+            if self.stop_flag:
+                self.trigger_start = False
+                return
+            time.sleep(0.1)
+            wait_counter+=1
+        self.trigger_start = False
+
+        if self.calibrate:
+            self.cal21 = None
+            freqs = np.linspace(MIN_FREQ, MAX_FREQ, CAL_POINTS)
+        else:
+            freqs = np.linspace(self.f0, self.f1, self.n)
+        out = {'freqs': [], 'db': []}
+        freq_index = 0
+        
+        while freq_index < len(freqs):
+            i = freq_index
+            f = freqs[i]
+            if self.stop_flag or self.trigger_start is True:
+                log.info("Trigger start true, starting from beginning")
+                break
+
+            point = self.check_devs()
+
+            # Delay is necessary when changging from end to begining
+            # without it first point is inccorect have lower power
+            delay = 0
+            if freq_index == 0:
+                delay = 1
+            try:
+                s21 = point.get(f, delay)
+
+            except RxFailed:
+                log.warning("Getting point failed, Rx failed")
+                self.dev_rx = None
+                continue
+            except TxFailed:
+                log.warning("Getting point failed, Tx failed")
+                self.dev_tx = None
+                continue
+
+            out['freqs'].append(f)
+            out['db'].append(s21)
+
+            if s21 < -60 and self.calibrate:
+                print(f"Warning: RX signal is below -60dB something is wrong freq:{f}")
+
+            offset = None
+            if self.cal21 is not None:
+                offset = np.interp(f, self.cal21['freqs'], self.cal21['db'])
+                s21 -= offset
+            try:
+                rssi = self.dev_rx._get_iio_attr('voltage0','rssi', False)
+                log.info(f"S21 calibrated: {s21} calib offset: {offset} RSSI: -{rssi}dB")
+            except Exception as e:
+                log.warning("Getting RSSI failed")
+                self.dev_rx = None
+                continue
+
+            self.update.emit(f, s21)
+
+            if self.scan_paused is False:
+                freq_index += 1
+
+        if self.dev_tx:
+            self.dev_tx.tx_destroy_buffer()
+        if self.dev_rx:
+            self.dev_rx.rx_destroy_buffer()
+
+
+        self.scan_finished.emit()
+
+        if self.calibrate:
+            log.info("Saving calibration data")
+            np.savez("cal_s21.npz", **out)
+
+        log.info("Worker thread exited")
+
+
+# ───────────── GUI with toggles + markers ─────────────
+class VNA(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.exit_loops = False
+        self.freq_start = MIN_FREQ
+        self.freq_stop = MAX_FREQ
+        self.steps = DEFAULT_STEPS
+
+        self.setWindowTitle("2 pluto device scalar analyser")
+        self.cal_dlg = None
+        self.fft_marker = []
+        self._build_ui()
+        self._init_plot()
+        self._spawn_worker()
+        self.wk.trigger_start_signal.emit(False)
+        signal.signal(signal.SIGINT, self.sig_int)
 
     # --- UI bar + checkboxes ---
     def _build_ui(self):
@@ -454,7 +473,7 @@ class VNA(QMainWindow):
         self.first_plot = True
         print("Start from beginning")
         self._spawn_worker()
-        self.wk.trigger_start_signal.emit()
+        self.wk.trigger_start_signal.emit(False)
 
     # --- traces + markers storage + titles ---
     def _init_plot(self):
@@ -489,14 +508,11 @@ class VNA(QMainWindow):
 
     # --- worker startup ---
     def _spawn_worker(self):
-        self.wk = SweepThread(self.sdr_tx_device, self.sdr_rx_device, self.freq_start, self.freq_stop, self.steps)
-        if os.path.exists('cal_s21.npz'):
-            self.load_s21()
+        self.wk = SweepThread(self.freq_start, self.freq_stop, self.steps)
         self.wk.update.connect(self._update_plot)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
         self.wk.scan_finished.connect(self._scan_finished)
         self.wk.start()
-        self.wk.get_devs_response_signal.connect(self._get_devices_signal_handle)
 
     # --- span handling ---
     def apply_span(self):
@@ -516,7 +532,7 @@ class VNA(QMainWindow):
         self.wk.update.disconnect()
         self._reset_plot()
         self._spawn_worker()
-        self.wk.trigger_start_signal.emit()
+        self.wk.trigger_start_signal.emit(False)
         # self.wk.stop_flag = False
         # self.wk.start()
         self.axes_s21.set_xlim(self.freq_start/1e9, self.freq_stop/1e9)
@@ -529,9 +545,13 @@ class VNA(QMainWindow):
         print("first_plot set to false")
         self.wk.scan_finished.disconnect()
         self.wk.update.disconnect()
+        if self.cal_dlg:
+            self.cal_dlg.close()
+            self.cal_dlg = None
+
         if not self.checkbox_single.isChecked():
             self._spawn_worker()
-            self.wk.trigger_start_signal.emit()
+            self.wk.trigger_start_signal.emit(False)
 
     def _reset_plot(self):
         self.point_index = 0
@@ -576,12 +596,36 @@ class VNA(QMainWindow):
         self.axes_s21.autoscale_view(scalex=False)
      
         global fft_magnitude_db
+        freq_peak_index = np.argmax(fft_magnitude_db)
+        freq_peak = self.freqs[freq_peak_index]
+        s21_peak = fft_magnitude_db[freq_peak_index]
         self.fft_line.set_data(self.freqs, fft_magnitude_db)
+        
+        for m in self.fft_marker:
+            print(m)
+            m.remove()
+        self.fft_marker.clear()
+     
+        mark = self.axes_fft.plot(freq_peak, s21_peak, 'kx', ms=8, mew=2)[0]
+        txt_mark = self.axes_fft.annotate(f"{s21_peak:.2f} dB\n{freq_peak:.3f} Hz",
+                              (freq_peak+5000, s21_peak-10),
+                              textcoords="offset points",
+                              xytext=(5, 5),
+                              fontsize=8,
+                              color='k',
+                              bbox=dict(boxstyle="round,pad=0.2", fc='w', alpha=0.7))
+        self.fft_marker.extend([mark, txt_mark])
+
 
         self.axes_fft.relim(); 
         self.axes_fft.autoscale_view(scalex=False)
 
         self.canvas.draw_idle()
+
+        if self.cal_dlg:
+            self.cal_dlg.setValue(self.point_index)
+            QApplication.processEvents()
+
         self.point_index  += 1
 
     # --- visibility toggles ---
@@ -624,48 +668,39 @@ class VNA(QMainWindow):
             self._clear_markers()
             self.canvas.draw_idle()
 
-    # --- calibration helpers (unchanged) ---
-    def _do_cal(self, msg):
-        freqs = np.linspace(MIN_FREQ, MAX_FREQ, CAL_POINTS)
-        out = {'freqs': [], 'db': []}
-        dlg = QProgressDialog(msg, "Cancel", 0, len(freqs), self)
-        dlg.setWindowModality(Qt.WindowModality.ApplicationModal); dlg.show()
-        point = Point(self.sdr_tx_device, self.sdr_rx_device)
-        for i, f in enumerate(freqs):
-            if dlg.wasCanceled():
-                return None
-            dlg.setValue(i); QApplication.processEvents()
-          
-            s21_point= point.get(f)
-            print(f"Calpoint f:{f} value: {s21_point}dB")
-            out['freqs'].append(f)
-            out['db'].append(s21_point)
-            if s21_point < -60:
-                print(f"Warning: RX signal is below -60dB something is wrong freq:{f}")
-        dlg.close()
-        return {k: np.array(v) for k, v in out.items()}
 
-    # --- S21 helpers ---
-    def cal_s21(self):
-        log.info("Calibration started")
-        self.device_check_timer.stop()
+    def cancel_calibration(self):
+        log.info("Cancel calibration pressed. Starting normal thread")
+        self.cal_dlg.close()
+        self.cal_dlg = None
         self.wk.stop()
         self.wk.wait()
         self.wk.scan_finished.disconnect()
         self.wk.update.disconnect()
         self._reset_plot()
-        data = self._do_cal("Calibrating S21…")
-        if data is not None:
-            np.savez("cal_s21.npz", **data)
-            self.load_s21()
-
         self._spawn_worker()
-        self.wk.trigger_start_signal.emit()
+        self.wk.trigger_start_signal.emit(False)
+
+    def cal_s21(self):
+        log.info("Calibration started")
+        self.wk.stop()
+        self.wk.wait()
+        self.wk.scan_finished.disconnect()
+        self.wk.update.disconnect()
+        self._reset_plot()
+        self._spawn_worker()
+        self.wk.trigger_start_signal.emit(True)
+      
+        self.cal_dlg = QProgressDialog("Calibrating S21…", "Cancel", 0, CAL_POINTS, self)
+        self.cal_dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.cal_dlg.show()
+
+        cancelButton = self.cal_dlg.findChild(QPushButton)
+        cancelButton.clicked.connect(self.cancel_calibration)
+
 
     def load_s21(self):
-        d = np.load("cal_s21.npz")
-        self.wk.load_cal21({'freqs': d['freqs'], 'db': d['db']})
-        print("S21 calibration loaded")
+        print("Load function not implemented")
 
     def sig_int(self, signum, frame):
         print("Ctrl+c pressed SIGINT received, exitting")
@@ -676,10 +711,6 @@ class VNA(QMainWindow):
         self.exit_loops = True
         self.wk.stop()
         self.wk.wait()
-        if self.sdr_tx_device:
-            self.sdr_tx_device.tx_destroy_buffer()
-        if self.sdr_tx_device:
-            self.sdr_tx_device.rx_destroy_buffer()
 
     # --- cleanup ---
     def closeEvent(self, e):
