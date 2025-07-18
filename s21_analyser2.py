@@ -36,6 +36,7 @@ MIN_FREQ, MAX_FREQ, SWEEP_INIT_DELAY = 0.3e9, 6e9, 2.0
 TX_BUFFER_SIZE = 1_000
 
 RX_HARDWARE_GAIN = 30
+TX_ATTENUATOR_GAIN = -3
 
 # ───────────── FIR filter for lock-in ─────────────
 nyq     = AD_SAMPLING_FREQUENCY / 2
@@ -167,6 +168,18 @@ class SweepThread(QThread):
         self.pause_signal.connect(self._pause_signal_handle)
         self.scan_paused = False
         self.calibrate = False
+        self.next_point = False
+        self.prev_point = False
+
+
+    def slot_next_point(self):
+        log.info("Next frequency point")
+        self.next_point = True
+
+
+    def slot_prev_point(self):
+        log.info("Previous frequency point")
+        self.prev_point = True
 
 
     def _pause_signal_handle(self, paused: bool):
@@ -214,7 +227,7 @@ class SweepThread(QThread):
                 sdr_tx_device.tx_rf_bandwidth         = int(RF_FILTER_BANDWIDTH)
                 sdr_tx_device.tx_buffer_size          = TX_BUFFER_SIZE
                 sdr_tx_device.tx_cyclic_buffer        = True
-                sdr_tx_device.tx_hardwaregain_chan0   = -3
+                sdr_tx_device.tx_hardwaregain_chan0   = TX_ATTENUATOR_GAIN
 
                 #this is not  used in sdr_tx_device but I think should be configured to be in known state
                 sdr_tx_device.sample_rate             = int(AD_SAMPLING_FREQUENCY)
@@ -249,7 +262,7 @@ class SweepThread(QThread):
                 sdr_rx_device.rx_hardwaregain_chan0   = RX_HARDWARE_GAIN
                 sdr_rx_device.tx_hardwaregain_chan0   = -89
                 sdr_rx_device._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
-                sdr_rx_device._set_iio_dev_attr_str("xo_correction", 40000000-300)
+                sdr_rx_device._set_iio_dev_attr_str("xo_correction", 40000000-290)
                 print(f"XO correcton: {sdr_rx_device._get_iio_dev_attr("xo_correction")}")
                 print("RX device created and configured")
                 return sdr_rx_device
@@ -353,6 +366,14 @@ class SweepThread(QThread):
             if self.scan_paused is False:
                 freq_index += 1
 
+            if self.next_point:
+                self.next_point = False
+                freq_index += 1
+
+            if self.prev_point:
+                self.prev_point = False
+                freq_index -= 1
+
         if self.dev_tx:
             self.dev_tx.tx_destroy_buffer()
         if self.dev_rx:
@@ -383,6 +404,8 @@ class VNA(QMainWindow):
         self._build_ui()
         self._init_plot()
         self._spawn_worker()
+        self.button_next.clicked.connect(self.wk.slot_next_point)
+        self.button_prev.clicked.connect(self.wk.slot_prev_point)
         self.wk.trigger_start_signal.emit(False)
         signal.signal(signal.SIGINT, self.sig_int)
 
@@ -395,7 +418,11 @@ class VNA(QMainWindow):
         top = QFrame()
         top.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
 
-        h_box1 = QHBoxLayout(top)
+        h_box1 = QHBoxLayout()
+        h_box2 = QHBoxLayout()
+
+        box1.addLayout(h_box1)
+        box1.addLayout(h_box2)
 
         for lbl, attr, val in [
             ("Start (MHz):","le0", int(MIN_FREQ/1e6)),
@@ -450,11 +477,30 @@ class VNA(QMainWindow):
 
         button_pause = QPushButton("Pause")
         button_pause.clicked.connect(self._pause_emit)
-        h_box1.addWidget(button_pause)
+        h_box2.addWidget(button_pause)
 
         button_continue = QPushButton("Continue")
         button_continue.clicked.connect(self._continue_emit)
-        h_box1.addWidget(button_continue)
+        h_box2.addWidget(button_continue)
+
+        self.button_next = QPushButton("Next")
+        h_box2.addWidget(self.button_next)
+
+        self.button_prev = QPushButton("Prev")
+        h_box2.addWidget(self.button_prev)
+
+        label_rx_att = QLabel('RX att: 30dB')
+        h_box2.addWidget(label_rx_att)
+
+        label_tx_att = QLabel('TX att: 10dB')
+        h_box2.addWidget(label_tx_att)
+
+        label_rx_gain = QLabel(f'RX gain: {RX_HARDWARE_GAIN}dB')
+        h_box2.addWidget(label_rx_gain)
+
+        label_tx_ad_att = QLabel(f'TX att ad: {TX_ATTENUATOR_GAIN}dB')
+        h_box2.addWidget(label_tx_ad_att)
+        
 
     def _pause_emit(self):
         self.wk.pause_signal.emit(True)
