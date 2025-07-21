@@ -236,6 +236,10 @@ class SweepThread(QThread):
                 sdr_tx_device.gain_control_mode_chan0 = "manual"
                 sdr_tx_device.rx_hardwaregain_chan0   = 0
                 sdr_tx_device._set_iio_attr("out", "voltage_filter_fir_en", False, 0)
+                # With tx calibration enabled, after some time like 1h of working
+                # there appears 15dB tranmit power reduction, beteen 500MHz and 2GHz
+                #therefore it should be disabled
+                sdr_tx_device._set_iio_dev_attr_str("calib_mode", "manual")
                 _t = np.arange(TX_BUFFER_SIZE) / AD_SAMPLING_FREQUENCY
                 tx_samples = (0.5*np.exp(2j * np.pi * TX_TONE_FREQ * _t)).astype(np.complex64)
                 tx_samples *= 2**14 
@@ -404,8 +408,6 @@ class VNA(QMainWindow):
         self._build_ui()
         self._init_plot()
         self._spawn_worker()
-        self.button_next.clicked.connect(self.wk.slot_next_point)
-        self.button_prev.clicked.connect(self.wk.slot_prev_point)
         self.wk.trigger_start_signal.emit(False)
         signal.signal(signal.SIGINT, self.sig_int)
 
@@ -558,6 +560,8 @@ class VNA(QMainWindow):
         self.wk.update.connect(self._update_plot)
         self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
         self.wk.scan_finished.connect(self._scan_finished)
+        self.button_next.clicked.connect(self.wk.slot_next_point)
+        self.button_prev.clicked.connect(self.wk.slot_prev_point)
         self.wk.start()
 
     # --- span handling ---
