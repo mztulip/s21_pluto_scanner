@@ -14,7 +14,7 @@ from scipy.signal import kaiserord, firwin, lfilter, fftconvolve, oaconvolve
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
-    QFrame, QProgressDialog, QMessageBox, QCheckBox)
+    QFrame, QProgressDialog, QMessageBox, QCheckBox, QTabWidget, QListWidget)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 
 log = logging.getLogger(__name__)
@@ -152,6 +152,7 @@ class SweepThread(QThread):
     update_devices_signal = pyqtSignal(object, object)
     get_devs_request_signal = pyqtSignal()
     get_devs_response_signal = pyqtSignal(object, object)
+    freqs_created = pyqtSignal(object)
 
 
     def __init__(self, f_start, f_end, steps):
@@ -170,6 +171,7 @@ class SweepThread(QThread):
         self.calibrate = False
         self.next_point = False
         self.prev_point = False
+        self.freqs_list = None
 
 
     def slot_next_point(self):
@@ -315,15 +317,16 @@ class SweepThread(QThread):
 
         if self.calibrate:
             self.cal21 = None
-            freqs = np.linspace(MIN_FREQ, MAX_FREQ, CAL_POINTS)
+            self.freqs_list = np.linspace(MIN_FREQ, MAX_FREQ, CAL_POINTS)
         else:
-            freqs = np.linspace(self.f0, self.f1, self.n)
+            self.freqs_list = np.linspace(self.f0, self.f1, self.n)
         out = {'freqs': [], 'db': []}
         freq_index = 0
-        
-        while freq_index < len(freqs):
+        self.freqs_created.emit(self.freqs_list)
+
+        while freq_index < len(self.freqs_list):
             i = freq_index
-            f = freqs[i]
+            f = self.freqs_list[i]
             if self.stop_flag or self.trigger_start is True:
                 log.info("Trigger start true, starting from beginning")
                 break
@@ -411,11 +414,26 @@ class VNA(QMainWindow):
         self.wk.trigger_start_signal.emit(False)
         signal.signal(signal.SIGINT, self.sig_int)
 
+
+    def _build_freqs_tab(self, freqs_widget):
+        layout = QVBoxLayout(freqs_widget)
+        self.freq_list_widget = QListWidget()
+        layout.addWidget(self.freq_list_widget)
+
     # --- UI bar + checkboxes ---
     def _build_ui(self):
-        cw = QWidget()
-        self.setCentralWidget(cw)
-        box1 = QVBoxLayout(cw)
+        tabs = QTabWidget()
+        # tabs.setTabPosition(QTabWidget.West)
+        tabs.setMovable(True)
+
+        s21_central_widget = QWidget()
+        freqs_central_widget = QWidget()
+        self._build_freqs_tab(freqs_central_widget)
+
+        tabs.addTab(s21_central_widget, "s21")
+        tabs.addTab(freqs_central_widget, "freqs")
+        self.setCentralWidget(tabs)
+        box1 = QVBoxLayout(s21_central_widget)
 
         top = QFrame()
         top.setFrameStyle(QFrame.Shape.Box | QFrame.Shadow.Raised)
@@ -554,6 +572,15 @@ class VNA(QMainWindow):
         self._vis_toggle()
         self.point_index = 0
 
+
+    def _freqs_tab_update_slot(self, freqs):
+        line_list = []
+        for index, freq in enumerate(freqs):
+            line = f" {index}: {freq}"
+            line_list.append(line)
+        self.freq_list_widget.addItems(line_list)
+
+
     # --- worker startup ---
     def _spawn_worker(self):
         self.wk = SweepThread(self.freq_start, self.freq_stop, self.steps)
@@ -562,6 +589,7 @@ class VNA(QMainWindow):
         self.wk.scan_finished.connect(self._scan_finished)
         self.button_next.clicked.connect(self.wk.slot_next_point)
         self.button_prev.clicked.connect(self.wk.slot_prev_point)
+        self.wk.freqs_created.connect(self._freqs_tab_update_slot)
         self.wk.start()
 
     # --- span handling ---
