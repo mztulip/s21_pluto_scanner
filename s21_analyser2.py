@@ -144,7 +144,7 @@ class Point():
 
 # ───────────── worker thread ─────────────
 class SweepThread(QThread):
-    update  = pyqtSignal(float, float)
+    update  = pyqtSignal(int, float, float)
     scan_finished = pyqtSignal()
     trigger_start_signal = pyqtSignal(bool)
     error   = pyqtSignal(str)
@@ -153,6 +153,7 @@ class SweepThread(QThread):
     get_devs_request_signal = pyqtSignal()
     get_devs_response_signal = pyqtSignal(object, object)
     freqs_created = pyqtSignal(object)
+    update_freq_index = pyqtSignal(int)
 
 
     def __init__(self, f_start, f_end, steps):
@@ -172,6 +173,11 @@ class SweepThread(QThread):
         self.next_point = False
         self.prev_point = False
         self.freqs_list = None
+        self.update_freq_index.connect(self._update_freq_index)
+
+
+    def _update_freq_index(self, freq_index):
+        self.freq_index = freq_index
 
 
     def slot_next_point(self):
@@ -321,11 +327,11 @@ class SweepThread(QThread):
         else:
             self.freqs_list = np.linspace(self.f0, self.f1, self.n)
         out = {'freqs': [], 'db': []}
-        freq_index = 0
+        self.freq_index = 0
         self.freqs_created.emit(self.freqs_list)
 
-        while freq_index < len(self.freqs_list):
-            i = freq_index
+        while self.freq_index < len(self.freqs_list):
+            i = self.freq_index
             f = self.freqs_list[i]
             if self.stop_flag or self.trigger_start is True:
                 log.info("Trigger start true, starting from beginning")
@@ -336,7 +342,7 @@ class SweepThread(QThread):
             # Delay is necessary when changging from end to begining
             # without it first point is inccorect have lower power
             delay = 0
-            if freq_index == 0:
+            if self.freq_index == 0:
                 delay = 1
             try:
                 s21 = point.get(f, delay)
@@ -368,18 +374,18 @@ class SweepThread(QThread):
                 self.dev_rx = None
                 continue
 
-            self.update.emit(f, s21)
+            self.update.emit(self.freq_index ,f, s21)
 
             if self.scan_paused is False:
-                freq_index += 1
+                self.freq_index += 1
 
             if self.next_point:
                 self.next_point = False
-                freq_index += 1
+                self.freq_index += 1
 
             if self.prev_point:
                 self.prev_point = False
-                freq_index -= 1
+                self.freq_index -= 1
 
         if self.dev_tx:
             self.dev_tx.tx_destroy_buffer()
@@ -486,9 +492,6 @@ class VNA(QMainWindow):
         pb_start.clicked.connect(self._start_from_beginning)
         h_box1.addWidget(pb_start)
 
-        self.freq_label = QLabel("f:--")
-        h_box1.addWidget(self.freq_label)
-
         self.fig, (self.axes_s21, self.axes_fft) = plt.subplots(2,1, figsize=(12,9))
         # self.axes_fft.axis('off')
         self.canvas = FigureCanvas(self.fig)
@@ -509,6 +512,14 @@ class VNA(QMainWindow):
         self.button_prev = QPushButton("Prev")
         h_box2.addWidget(self.button_prev)
 
+        self.freq_index_line_edit = QLineEdit()
+        self.freq_index_line_edit.setFixedWidth(40)
+        self.freq_index_line_edit.editingFinished.connect(self._update_freq_index)
+        h_box2.addWidget(self.freq_index_line_edit)
+
+        self.freq_label = QLabel("f:--")
+        h_box2.addWidget(self.freq_label)
+
         label_rx_att = QLabel('RX att: 30dB')
         h_box2.addWidget(label_rx_att)
 
@@ -521,6 +532,10 @@ class VNA(QMainWindow):
         label_tx_ad_att = QLabel(f'TX att ad: {TX_ATTENUATOR_GAIN}dB')
         h_box2.addWidget(label_tx_ad_att)
         
+    def _update_freq_index(self):
+        value = int(self.freq_index_line_edit.text())
+        log.info(f"Entered frequency index: {value}")
+        self.wk.update_freq_index.emit(value)
 
     def _pause_emit(self):
         self.wk.pause_signal.emit(True)
@@ -576,7 +591,7 @@ class VNA(QMainWindow):
     def _freqs_tab_update_slot(self, freqs):
         line_list = []
         for index, freq in enumerate(freqs):
-            line = f" {index}: {freq}"
+            line = f" {index}: {freq/1e6}MHz"
             line_list.append(line)
         self.freq_list_widget.addItems(line_list)
 
@@ -644,9 +659,9 @@ class VNA(QMainWindow):
         self._clear_markers()
         self.canvas.draw()
 
-    def _update_plot(self, f_vco_hz, s21):
+    def _update_plot(self, freq_index, f_vco_hz, s21):
         fGHz = f_vco_hz/1e9
-        self.freq_label.setText(f"Freq:{fGHz*1000}MHz")
+        self.freq_label.setText(f"Freq:{fGHz*1000}MHz[{freq_index}]")
         if self.first_plot:
             x_data = self.first_data_x_s21
             y_data = self.first_data_y_s21
